@@ -1,0 +1,18 @@
+# Copy to ~/.config/ai4dev/config and fill in the two URLs from the facilitator.
+# This file is sourced by the shell. Do not put your key in it: the key lives in
+# your secret manager and is fetched on every call.
+
+AI4DEV_GATEWAY_URL="https://<cohort-gateway>/v1"
+AI4DEV_DASHBOARD_URL="https://<cohort-dashboard>"
+
+# Where 'ai4dev init' clones the course repositories.
+AI4DEV_WORKSPACE="$HOME/ai4dev"
+
+# The secret manager entry that holds your personal virtual key.
+AI4DEV_SECRET_REF="AI4DEV_API_KEY"
+
+# Where the course repositories live.
+AI4DEV_GIT_BASE="git@github.com:aiscream"
+
+# The tag the product repository starts from. Changes every module.
+AI4DEV_START_TAG="module-01-start"

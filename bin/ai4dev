@@ -1,0 +1,391 @@
+#!/usr/bin/env bash
+#
+# ai4dev — the AI4Dev course CLI
+#
+# This script lives in YOUR kit. It is true of you, not of any codebase, and it
+# follows you into every repository you work in. No AI command is ever defined
+# inside a product repository.
+#
+#   ai4dev init            clone the course repositories into ~/ai4dev
+#   ai4dev doctor          verify everything, fetch your key, make one real request
+#   ai4dev review <file>   review a file with YOUR review prompt, from this kit
+#   ai4dev commit          write a commit message from the staged diff
+#   ai4dev costs           your spend, your remaining budget, where your traces are
+#   ai4dev key             re-fetch your virtual key from the secret manager
+#   ai4dev config          show the resolved configuration
+#
+# Config resolution: environment > ~/.config/ai4dev/config > defaults.
+# The virtual key is never written to disk by this script.
+
+set -euo pipefail
+
+readonly AI4DEV_VERSION="1.0.0"
+readonly CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ai4dev/config"
+
+# The kit is this script's own repository: bin/ai4dev -> repo root.
+KIT_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+# ─── output ──────────────────────────────────────────────────────────────────
+
+if [[ -t 1 ]]; then
+  R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[34m'; D=$'\033[2m'; N=$'\033[0m'
+else
+  R=""; G=""; Y=""; B=""; D=""; N=""
+fi
+
+ok()   { printf '%s✓%s %s\n' "$G" "$N" "$1"; }
+bad()  { printf '%s✗%s %s\n' "$R" "$N" "$1"; [[ -n "${2:-}" ]] && printf '  %s→ %s%s\n' "$D" "$2" "$N"; FAILED=1; }
+warn() { printf '%s!%s %s\n' "$Y" "$N" "$1"; }
+info() { printf '%s%s%s\n' "$D" "$1" "$N"; }
+die()  { printf '%serror:%s %s\n' "$R" "$N" "$1" >&2; exit 1; }
+
+# ─── config ──────────────────────────────────────────────────────────────────
+
+load_config() {
+  # shellcheck disable=SC1090
+  [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+  AI4DEV_KIT="${AI4DEV_KIT:-$KIT_ROOT}"
+  AI4DEV_WORKSPACE="${AI4DEV_WORKSPACE:-$HOME/ai4dev}"
+  AI4DEV_GATEWAY_URL="${AI4DEV_GATEWAY_URL:-}"
+  AI4DEV_DASHBOARD_URL="${AI4DEV_DASHBOARD_URL:-}"
+  AI4DEV_SECRET_REF="${AI4DEV_SECRET_REF:-AI4DEV_API_KEY}"
+  AI4DEV_GIT_BASE="${AI4DEV_GIT_BASE:-git@github.com:aiscream}"
+  AI4DEV_START_TAG="${AI4DEV_START_TAG:-module-01-start}"
+}
+
+require_gateway() {
+  [[ -n "$AI4DEV_GATEWAY_URL" ]] || die "AI4DEV_GATEWAY_URL is not set. See $CONFIG_FILE"
+}
+
+# ─── the virtual key ─────────────────────────────────────────────────────────
+#
+# Fetched from the secret manager on every invocation and held in memory only.
+# It is a gateway-issued virtual key, not a provider key: it carries your
+# identity and your budget, and it cannot talk to a provider directly.
+
+fetch_key() {
+  local key=""
+
+  if [[ -n "${AI4DEV_API_KEY:-}" ]]; then
+    printf '%s' "$AI4DEV_API_KEY"; return 0
+  fi
+
+  if command -v infisical >/dev/null 2>&1; then
+    key="$(infisical secrets get "$AI4DEV_SECRET_REF" --plain 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$key" ]] && command -v op >/dev/null 2>&1; then
+    key="$(op read "op://AI4Dev/$AI4DEV_SECRET_REF/credential" 2>/dev/null || true)"
+  fi
+
+  [[ -n "$key" ]] || return 1
+  printf '%s' "$key"
+}
+
+# ─── gateway call ────────────────────────────────────────────────────────────
+#
+# call <role> <prompt> [k=v,k=v]
+# The role is a named alias configured on the gateway (reviewer, committer,
+# architect, tester). You never name a model here: which model answers is an
+# infrastructure decision made by somebody else, and that is the point.
+
+call() {
+  local role="$1" prompt="$2" meta="${3:-}"
+  require_gateway
+
+  local key; key="$(fetch_key)" || die "could not fetch your virtual key. Run 'ai4dev key'."
+
+  local meta_json='{}'
+  if [[ -n "$meta" ]]; then
+    meta_json="$(printf '%s' "$meta" | jq -R 'split(",") | map(split("=") | {(.[0]): .[1]}) | add')"
+  fi
+  meta_json="$(jq -n --argjson m "$meta_json" --arg u "${USER:-unknown}" \
+                     '$m + {user: $u, source: "ai4dev-cli"}')"
+
+  local payload
+  payload="$(jq -n --arg model "$role" --arg content "$prompt" --argjson metadata "$meta_json" \
+    '{model: $model, messages: [{role: "user", content: $content}], metadata: $metadata}')"
+
+  local response
+  response="$(curl -sS --fail-with-body -X POST "$AI4DEV_GATEWAY_URL/chat/completions" \
+    -H "Authorization: Bearer $key" \
+    -H "Content-Type: application/json" \
+    -d "$payload")" || die "the gateway refused the request. Run 'ai4dev doctor'."
+
+  if printf '%s' "$response" | jq -e '.error' >/dev/null 2>&1; then
+    die "$(printf '%s' "$response" | jq -r '.error.message // .error')"
+  fi
+
+  printf '%s' "$response" | jq -r '.choices[0].message.content'
+}
+
+render() {
+  # render <template> <placeholder> <value> [<placeholder> <value> ...]
+  local out; out="$(cat "$1")"; shift
+  while [[ $# -gt 1 ]]; do
+    out="${out//\[\[$1\]\]/$2}"
+    shift 2
+  done
+  printf '%s' "$out"
+}
+
+# ─── commands ────────────────────────────────────────────────────────────────
+
+cmd_init() {
+  load_config
+  info "workspace: $AI4DEV_WORKSPACE"
+  info "kit:       $AI4DEV_KIT  (this repository — you are already in it)"
+  printf '\n'
+  mkdir -p "$AI4DEV_WORKSPACE"
+
+  local repo
+  for repo in tinder4dogs tinder4dogs-legacy ai4dev-infrastructure; do
+    if [[ -d "$AI4DEV_WORKSPACE/$repo/.git" ]]; then
+      ok "$repo already cloned"
+    else
+      if git clone --quiet "$AI4DEV_GIT_BASE/$repo.git" "$AI4DEV_WORKSPACE/$repo" 2>/dev/null; then
+        ok "$repo cloned"
+      else
+        warn "could not clone $repo — check your GitHub access, then ask on Slack"
+      fi
+    fi
+  done
+
+  if [[ -d "$AI4DEV_WORKSPACE/tinder4dogs/.git" ]]; then
+    if ( cd "$AI4DEV_WORKSPACE/tinder4dogs" \
+         && git fetch --quiet --tags \
+         && git checkout --quiet "$AI4DEV_START_TAG" ) 2>/dev/null; then
+      ok "product at tag $AI4DEV_START_TAG"
+    else
+      warn "tag $AI4DEV_START_TAG not found — the facilitator will say which tag to use"
+    fi
+  fi
+
+  printf '\n'
+  info "$AI4DEV_WORKSPACE/"
+  info "├── tinder4dogs/             the product. No AI inside it."
+  info "├── tinder4dogs-legacy/      the same product, as inherited three years ago."
+  info "└── ai4dev-infrastructure/   the gateway and observability. You read it, you do not run it."
+  printf '\n'
+  info "$AI4DEV_KIT/                 yours. It grows every module, and it goes home with you."
+  printf '\n'
+  ok "ready. Now run: ai4dev doctor"
+}
+
+cmd_doctor() {
+  load_config
+  FAILED=0
+  printf '%sai4dev doctor%s  (v%s)\n\n' "$B" "$N" "$AI4DEV_VERSION"
+
+  # toolchain
+  if command -v mise >/dev/null 2>&1; then ok "mise $(mise --version 2>/dev/null | head -1)"
+  else bad "mise not found" "brew install mise, then add 'eval \"\$(mise activate zsh)\"' to your shell profile"; fi
+
+  if command -v git >/dev/null 2>&1; then ok "git $(git --version | awk '{print $3}')"
+  else bad "git not found" "brew install git"; fi
+
+  local gitname gitmail
+  gitname="$(git config --global user.name  2>/dev/null || true)"
+  gitmail="$(git config --global user.email 2>/dev/null || true)"
+  if [[ -n "$gitname" && -n "$gitmail" ]]; then ok "git identity: $gitname <$gitmail>"
+  else bad "git identity not configured" "git config --global user.name '...' && git config --global user.email '...'"; fi
+
+  if command -v jq >/dev/null 2>&1; then ok "jq present"; else bad "jq not found" "brew install jq"; fi
+
+  if command -v betterleaks >/dev/null 2>&1; then ok "betterleaks present"
+  else bad "betterleaks not found" "brew install betterleaks"; fi
+
+  # container runtime — for the product's own database only
+  if docker info >/dev/null 2>&1; then
+    local runtime="docker"
+    if docker context show 2>/dev/null | grep -qi orb; then runtime="OrbStack"; fi
+    ok "container runtime reachable ($runtime)"
+  elif command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+    ok "container runtime reachable (podman)"
+  else
+    bad "no container runtime is running" "start OrbStack, Docker Desktop or Podman. Only needed for the product database."
+  fi
+
+  # secret manager
+  if command -v infisical >/dev/null 2>&1; then
+    if infisical user get >/dev/null 2>&1; then ok "secret manager authenticated (infisical)"
+    else bad "secret manager not logged in" "infisical login"; fi
+  elif command -v op >/dev/null 2>&1; then
+    ok "secret manager present (1password)"
+  else
+    bad "no secret manager CLI found" "install the Infisical CLI and run 'infisical login'"
+  fi
+
+  # kit and workspace
+  if [[ -f "$AI4DEV_KIT/prompts/code_review.md" ]]; then ok "kit at $AI4DEV_KIT"
+  else bad "kit looks incomplete at $AI4DEV_KIT" "re-clone the kit repository"; fi
+
+  if [[ -d "$AI4DEV_WORKSPACE/tinder4dogs/.git" ]]; then
+    local tag; tag="$(cd "$AI4DEV_WORKSPACE/tinder4dogs" && git describe --tags --exact-match 2>/dev/null || echo "no tag")"
+    if [[ "$tag" == "$AI4DEV_START_TAG" ]]; then ok "product at $AI4DEV_START_TAG"
+    else warn "product is at '$tag', expected $AI4DEV_START_TAG"; fi
+  else
+    warn "product not cloned — expected before the session. Run 'ai4dev init' when told to."
+  fi
+
+  # the two that matter
+  printf '\n'
+  local key
+  if key="$(fetch_key)"; then
+    ok "virtual key retrieved (${key:0:7}…)"
+  else
+    bad "could not retrieve your virtual key" "your key may not be issued yet. Ask on Slack. Never create your own."
+    printf '\n%s✗ doctor failed%s\n' "$R" "$N"; exit 1
+  fi
+
+  if [[ -z "$AI4DEV_GATEWAY_URL" ]]; then
+    bad "AI4DEV_GATEWAY_URL is not set" "see $CONFIG_FILE"
+  else
+    local reply
+    reply="$(call reviewer "Reply with exactly: ready" "task=doctor" 2>/dev/null || true)"
+    if [[ -n "$reply" ]]; then
+      ok "gateway reachable, one request traced: \"$(printf '%s' "$reply" | head -c 40)\""
+      cmd_costs --brief || true
+    else
+      bad "the gateway did not answer" "check AI4DEV_GATEWAY_URL, then ask on Slack"
+    fi
+  fi
+
+  printf '\n'
+  if [[ "$FAILED" -eq 0 ]]; then
+    printf '%s✓ you are ready%s\n' "$G" "$N"
+  else
+    printf '%s✗ fix the red lines above%s — ask on Slack, that is what it is for\n' "$R" "$N"; exit 1
+  fi
+}
+
+cmd_review() {
+  load_config
+  local file="${1:-}"
+  [[ -n "$file" ]] || die "usage: ai4dev review <file>"
+  [[ -f "$file" ]] || die "no such file: $file"
+
+  local template="$AI4DEV_KIT/prompts/code_review.md"
+  [[ -f "$template" ]] || die "no review prompt at $template"
+
+  local lang="${file##*.}"
+  local prompt; prompt="$(render "$template" CODE "$(cat "$file")" LANGUAGE "$lang" FILE "$file")"
+
+  info "reviewing $file with $template"
+  printf '\n'
+  call reviewer "$prompt" "task=code_review,file=$(basename "$file"),language=$lang"
+}
+
+cmd_commit() {
+  load_config
+  git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository"
+  git diff --staged --quiet && die "nothing staged. git add something first."
+
+  local template="$AI4DEV_KIT/prompts/commit_message.md"
+  [[ -f "$template" ]] || die "no commit prompt at $template"
+
+  local branch; branch="$(git rev-parse --abbrev-ref HEAD)"
+  local msg;    msg="$(call committer \
+                        "$(render "$template" DIFF "$(git diff --staged)" BRANCH "$branch")" \
+                        "task=commit,branch=$branch")"
+
+  printf '\n%s%s%s\n\n' "$B" "$msg" "$N"
+  read -rp "Commit with this message? [y/N] " answer
+  if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
+    printf '%s' "$msg" | git commit --quiet -F -
+    ok "committed"
+  else
+    info "not committed. The message is above if you want to edit it."
+  fi
+}
+
+cmd_costs() {
+  load_config
+  require_gateway
+  local brief=0; [[ "${1:-}" == "--brief" ]] && brief=1
+
+  local key; key="$(fetch_key)" || die "could not fetch your virtual key"
+
+  local base="${AI4DEV_GATEWAY_URL%/v1}"
+  local info_json
+  info_json="$(curl -sS "$base/key/info" -H "Authorization: Bearer $key" 2>/dev/null || echo '{}')"
+
+  local spend budget
+  spend="$( printf '%s' "$info_json" | jq -r '.info.spend      // .spend      // 0')"
+  budget="$(printf '%s' "$info_json" | jq -r '.info.max_budget // .max_budget // "unlimited"')"
+
+  if [[ "$budget" == "unlimited" || "$budget" == "null" ]]; then
+    printf '  spent: %s%.4f%s\n' "$B" "$spend" "$N"
+  else
+    printf '  spent: %s%.4f%s of %s   (%s left)\n' "$B" "$spend" "$N" "$budget" \
+      "$(awk -v b="$budget" -v s="$spend" 'BEGIN{printf "%.4f", b-s}')"
+  fi
+
+  [[ "$brief" -eq 1 ]] && return 0
+
+  printf '\n'
+  info "Your traces: ${AI4DEV_DASHBOARD_URL:-<dashboard URL not configured>}"
+  info "Open one and find four things: input tokens, output tokens, cost, and exactly what was sent."
+}
+
+cmd_key() {
+  load_config
+  local key
+  if key="$(fetch_key)"; then
+    ok "virtual key retrieved (${key:0:7}…)"
+    info "Held in memory only. This script never writes it to disk."
+  else
+    printf '%s✗%s could not retrieve your virtual key\n' "$R" "$N"
+    info "check your secret manager login, then ask on Slack"
+    exit 1
+  fi
+}
+
+cmd_config() {
+  load_config
+  printf '%sresolved configuration%s  (%s)\n\n' "$B" "$N" "$CONFIG_FILE"
+  printf '  AI4DEV_KIT           %s\n' "$AI4DEV_KIT"
+  printf '  AI4DEV_WORKSPACE     %s\n' "$AI4DEV_WORKSPACE"
+  printf '  AI4DEV_GATEWAY_URL   %s\n' "${AI4DEV_GATEWAY_URL:-<unset>}"
+  printf '  AI4DEV_DASHBOARD_URL %s\n' "${AI4DEV_DASHBOARD_URL:-<unset>}"
+  printf '  AI4DEV_SECRET_REF    %s\n' "$AI4DEV_SECRET_REF"
+  printf '  AI4DEV_GIT_BASE      %s\n' "$AI4DEV_GIT_BASE"
+  printf '  AI4DEV_START_TAG     %s\n' "$AI4DEV_START_TAG"
+  printf '\n'
+  info "The virtual key is not here. It is fetched from the secret manager on every call."
+}
+
+usage() {
+  cat <<EOF
+ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
+
+  ai4dev init            clone the course repositories into ~/ai4dev
+  ai4dev doctor          verify everything, fetch your key, make one real request
+  ai4dev review <file>   review a file with your review prompt, from your kit
+  ai4dev commit          write a commit message from the staged diff
+  ai4dev costs           your spend, your remaining budget, where your traces are
+  ai4dev key             re-fetch your virtual key from the secret manager
+  ai4dev config          show the resolved configuration
+
+This script lives in your kit. Edit prompts/code_review.md and the behaviour of
+'ai4dev review' changes in every repository you work in.
+EOF
+}
+
+main() {
+  case "${1:-help}" in
+    init)    shift; cmd_init    "$@" ;;
+    doctor)  shift; cmd_doctor  "$@" ;;
+    review)  shift; cmd_review  "$@" ;;
+    commit)  shift; cmd_commit  "$@" ;;
+    costs)   shift; cmd_costs   "$@" ;;
+    key)     shift; cmd_key     "$@" ;;
+    config)  shift; cmd_config  "$@" ;;
+    version|--version|-v) printf 'ai4dev %s\n' "$AI4DEV_VERSION" ;;
+    help|--help|-h) usage ;;
+    *) printf 'unknown command: %s\n\n' "$1"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
