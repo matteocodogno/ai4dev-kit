@@ -23,19 +23,22 @@ Nothing in here is product code. Nothing in a product repository is a copy of wh
 ## Install
 
 ```bash
-git clone <this repository> ~/ai4dev-kit
+git clone https://github.com/matteocodogno/ai4dev-kit.git ~/ai4dev-kit
 echo 'export PATH="$HOME/ai4dev-kit/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc
 exec $SHELL -l
 ai4dev version
 ```
 
-Then create your configuration from the example. The facilitator gives you the two URLs.
+Then create your configuration from the example and lock it down. Fill in the two URLs from Slack and **leave the key line empty** — the key is issued in the room on day 1.
 
 ```bash
 mkdir -p ~/.config/ai4dev
 cp config.example ~/.config/ai4dev/config
+chmod 600 ~/.config/ai4dev/config
 $EDITOR ~/.config/ai4dev/config
 ```
+
+Set the permissions now anyway: in a few days that file holds your key, and `ai4dev doctor` refuses to pass if it is readable by anyone else on the machine.
 
 And verify:
 
@@ -43,7 +46,7 @@ And verify:
 ai4dev doctor
 ```
 
-The last check makes one real request through the course gateway and prints your remaining budget. If it is green, you are ready for day 1 and the facilitator can see it without you reporting anything.
+Before day 1 it will report **`no virtual key yet`** in yellow and, if everything else is green, finish with **`ready for day 1`**. That is the correct result and there is nothing to fix. Once you paste the key in, the same command makes one real request through the course gateway and prints your remaining budget.
 
 ---
 
@@ -52,18 +55,20 @@ The last check makes one real request through the course gateway and prints your
 | Command | What it does |
 | --- | --- |
 | `ai4dev init` | Clones the course repositories into `~/ai4dev` |
-| `ai4dev doctor` | Verifies the environment, fetches your key, makes one real request |
+| `ai4dev doctor` | Verifies the environment. With a key, makes one real request; without one, says *ready for day 1* |
 | `ai4dev review <file>` | Reviews a file with **your** review prompt |
 | `ai4dev commit` | Writes a commit message from the staged diff |
 | `ai4dev costs` | Your spend, your remaining budget, where your traces are |
-| `ai4dev key` | Re-fetches your virtual key from the secret manager |
+| `ai4dev key` | Checks that your virtual key is present and your config file is locked down |
 | `ai4dev config` | Shows the resolved configuration |
 
 Three things worth knowing about how it works:
 
 **It never names a model.** It asks for a *role*: `reviewer`, `committer`, `architect`, `tester`. Which model answers is decided on the gateway, by someone else. You will notice this in Module 1 and it comes back in Module 11.
 
-**It never writes your key to disk.** The virtual key is fetched from your secret manager on every invocation and held in memory only. `ai4dev config` deliberately does not print it.
+**It never prints your key in full.** `ai4dev config` and `ai4dev key` show the first few characters and the permissions of the file holding it, never the whole thing. `doctor` fails if that file is readable by anyone else on the machine.
+
+**Your key is low-stakes on purpose.** It is capped at a fixed budget, it lives only as long as the course, and one call revokes it. That is why it can arrive by Slack DM instead of through a secret manager: the control is sized to the risk. Ask yourself whether the same reasoning holds for your employer's provider keys. It usually does not, and noticing the difference is the actual skill.
 
 **It reads its prompts from here.** Edit `prompts/code_review.md` and the behaviour of `ai4dev review` changes in every repository you work in. That is what "true of you" means, made executable.
 
@@ -79,7 +84,7 @@ ai4dev-kit/
 │   ├── code_review.md
 │   └── commit_message.md
 ├── skills/               your skills           — Module 3
-├── checklists/           your checklists       — Module 8
+├── checklists/           your checklists       — Module 1 onward
 ├── rubrics/              your eval rubrics     — Module 9
 └── notes/                whatever you want
 ```

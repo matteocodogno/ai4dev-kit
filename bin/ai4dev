@@ -7,7 +7,9 @@
 # inside a product repository.
 #
 #   ai4dev init            clone the course repositories into ~/ai4dev
-#   ai4dev doctor          verify everything, fetch your key, make one real request
+#   ai4dev doctor          verify everything; with a key, make one real request
+#                          (before day 1 there is no key yet — that is expected,
+#                           and doctor reports "ready for day 1" instead of red)
 #   ai4dev review <file>   review a file with YOUR review prompt, from this kit
 #   ai4dev commit          write a commit message from the staged diff
 #   ai4dev costs           your spend, your remaining budget, where your traces are
@@ -43,14 +45,25 @@ die()  { printf '%serror:%s %s\n' "$R" "$N" "$1" >&2; exit 1; }
 # ─── config ──────────────────────────────────────────────────────────────────
 
 load_config() {
+  # A value already exported in the environment wins over the config file. The
+  # file is the normal source; the environment is how you try a second key or a
+  # second gateway without editing it. Without this, `source` clobbers both, and
+  # the empty AI4DEV_API_KEY= line every participant has during priming would
+  # silently override a key you just exported — which looks exactly like a
+  # broken key and is not.
+  local env_key="${AI4DEV_API_KEY:-}" env_gateway="${AI4DEV_GATEWAY_URL:-}"
+
   # shellcheck disable=SC1090
   [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+  if [[ -n "$env_key" ]];     then AI4DEV_API_KEY="$env_key"; fi
+  if [[ -n "$env_gateway" ]]; then AI4DEV_GATEWAY_URL="$env_gateway"; fi
 
   AI4DEV_KIT="${AI4DEV_KIT:-$KIT_ROOT}"
   AI4DEV_WORKSPACE="${AI4DEV_WORKSPACE:-$HOME/ai4dev}"
   AI4DEV_GATEWAY_URL="${AI4DEV_GATEWAY_URL:-}"
   AI4DEV_DASHBOARD_URL="${AI4DEV_DASHBOARD_URL:-}"
-  AI4DEV_GIT_BASE="${AI4DEV_GIT_BASE:-git@github.com:aiscream}"
+  AI4DEV_GIT_BASE="${AI4DEV_GIT_BASE:-git@github.com:matteocodogno}"
   AI4DEV_START_TAG="${AI4DEV_START_TAG:-module-01-start}"
 }
 
@@ -79,7 +92,14 @@ fetch_key() {
 # The config file holds the key, so its permissions are part of the environment.
 config_mode() {
   [[ -f "$CONFIG_FILE" ]] || { printf 'missing'; return; }
-  stat -f '%Lp' "$CONFIG_FILE" 2>/dev/null || stat -c '%a' "$CONFIG_FILE" 2>/dev/null || printf 'unknown'
+  # BSD and GNU stat disagree on -f: on macOS it is the file's mode, on Linux it
+  # is filesystem status, which succeeds and prints several lines of nonsense.
+  # So try GNU first and validate the shape either way.
+  local m
+  m="$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null)" || m=""
+  [[ "$m" =~ ^[0-7]{3,4}$ ]] || m="$(stat -f '%Lp' "$CONFIG_FILE" 2>/dev/null)" || m=""
+  [[ "$m" =~ ^[0-7]{3,4}$ ]] || m="unknown"
+  printf '%s' "$m"
 }
 
 # ─── gateway call ────────────────────────────────────────────────────────────
@@ -93,7 +113,7 @@ call() {
   local role="$1" prompt="$2" meta="${3:-}"
   require_gateway
 
-  local key; key="$(fetch_key)" || die "could not fetch your virtual key. Run 'ai4dev key'."
+  local key; key="$(fetch_key)" || die "no virtual key configured. Paste the one from your Slack DM into $CONFIG_FILE, then run 'ai4dev doctor'."
 
   local meta_json='{}'
   if [[ -n "$meta" ]]; then
@@ -139,7 +159,7 @@ cmd_init() {
   mkdir -p "$AI4DEV_WORKSPACE"
 
   local repo
-  for repo in tinder4dogs tinder4dogs-legacy ai4dev-infrastructure; do
+  for repo in tinder4dogs tinder4dogs-legacy; do
     if [[ -d "$AI4DEV_WORKSPACE/$repo/.git" ]]; then
       ok "$repo already cloned"
     else
@@ -164,8 +184,10 @@ cmd_init() {
   printf '\n'
   info "$AI4DEV_WORKSPACE/"
   info "├── tinder4dogs/             the product. No AI inside it."
-  info "├── tinder4dogs-legacy/      the same product, as inherited three years ago."
-  info "└── ai4dev-infrastructure/   the gateway and observability. You read it, you do not run it."
+  info "└── tinder4dogs-legacy/      the same product, as inherited three years ago."
+  printf '\n'
+  info "The gateway and the observability stack are not here, and not on your machine."
+  info "They are operated for you. You will be shown them on the projector."
   printf '\n'
   info "$AI4DEV_KIT/                 yours. It grows every module, and it goes home with you."
   printf '\n'
@@ -228,14 +250,29 @@ cmd_doctor() {
   fi
 
   # the two that matter
+  #
+  # Before day 1 nobody has a key yet: it is issued in the room. A missing key
+  # is therefore not a failure, it is the expected state during priming, and
+  # doctor must say so instead of printing a red line at somebody who did
+  # everything right.
   printf '\n'
-  local key
+  local key have_key=0
   if key="$(fetch_key)"; then
     ok "virtual key present (${key:0:7}…)"
+    have_key=1
   else
-    bad "AI4DEV_API_KEY is not set" \
-        "it was sent to you by Slack DM. Paste it into $CONFIG_FILE. Never invent your own."
-    printf '\n%s✗ doctor failed%s\n' "$R" "$N"; exit 1
+    warn "no virtual key yet — normal before day 1, you receive it by Slack DM in the room"
+  fi
+
+  if [[ "$have_key" -eq 0 ]]; then
+    printf '\n'
+    if [[ "$FAILED" -eq 0 ]]; then
+      printf '%s✓ ready for day 1%s — everything you can check yourself is green.\n' "$G" "$N"
+      info "  The key and the first traced request are the first thing we do in the room."
+      exit 0
+    fi
+    printf '%s✗ fix the red lines above%s — ask on Slack, that is what it is for\n' "$R" "$N"
+    exit 1
   fi
 
   if [[ -z "$AI4DEV_GATEWAY_URL" ]]; then
