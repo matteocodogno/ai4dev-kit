@@ -14,8 +14,10 @@
 #
 # Required:
 #   LITELLM_MASTER_KEY    admin credential for the gateway
-#   SLACK_BOT_TOKEN       xoxb-… with scopes: chat:write, users:lookupByEmail
-#                         (some workspaces also require im:write)
+#   SLACK_BOT_TOKEN       xoxb-… with scopes: chat:write, users:read,
+#                         users:read.email  (users:read.email is the one that
+#                         authorises users.lookupByEmail; users:read alone is
+#                         not enough, and there is no users:lookupByEmail scope)
 #
 # Optional:
 #   AI4DEV_DELIVERY       slack (default) | csv | both
@@ -87,11 +89,29 @@ api() {
 
 slack() {
   # slack <method> <json-body> → response lands in $slack_file, returns 0 if ok:true
+  #
+  # JSON bodies are accepted by the write methods (chat.postMessage and kin).
+  # The read methods — auth.test, users.lookupByEmail — take form encoding only,
+  # and answer a JSON body with `invalid_arguments`, which reads like a bad
+  # email address but is really a bad Content-Type. Those go through slack_form.
   curl -sS -o "$slack_file" \
     -X POST "https://slack.com/api/$1" \
     -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
     -H "Content-Type: application/json; charset=utf-8" \
     -d "$2" </dev/null || true
+  jq -e '.ok == true' "$slack_file" >/dev/null 2>&1
+}
+
+slack_form() {
+  # slack_form <method> [key=value …] → same contract, form-encoded body
+  local method="$1"; shift
+  local args=() kv
+  for kv in "$@"; do args+=(--data-urlencode "$kv"); done
+  curl -sS -o "$slack_file" \
+    -X POST "https://slack.com/api/$method" \
+    -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+    -H "Content-Type: application/x-www-form-urlencoded; charset=utf-8" \
+    "${args[@]}" </dev/null || true
   jq -e '.ok == true' "$slack_file" >/dev/null 2>&1
 }
 
@@ -119,16 +139,16 @@ echo
 
 slack_ids=()
 if [[ "$use_slack" -eq 1 ]]; then
-  if ! slack auth.test '{}'; then
+  if ! slack_form auth.test; then
     echo "✗ Slack token rejected: $(slack_error)" >&2
-    echo "  needs scopes chat:write and users:lookupByEmail" >&2
+    echo "  needs scopes chat:write, users:read and users:read.email" >&2
     exit 1
   fi
   echo "✓ Slack token ok — posting as $(jq -r '.user // "?"' "$slack_file")"
 
   lookup_failed=0
   for i in "${!emails[@]}"; do
-    if slack users.lookupByEmail "$(jq -n --arg e "${emails[$i]}" '{email:$e}')"; then
+    if slack_form users.lookupByEmail "email=${emails[$i]}"; then
       slack_ids+=("$(jq -r '.user.id' "$slack_file")")
     else
       printf '  ✗ %-28s %s → %s\n' "${names[$i]}" "${emails[$i]}" "$(slack_error)" >&2
@@ -140,9 +160,14 @@ if [[ "$use_slack" -eq 1 ]]; then
   if [[ "$lookup_failed" -eq 1 ]]; then
     cat >&2 <<'HINT'
 
-✗ Some emails do not match a Slack account. Nothing has been created.
-  Usually: the person has not joined the workspace yet, or their Slack email
-  differs from the one in the CSV. Fix the CSV or chase the invite, then re-run.
+✗ Slack could not resolve every email. Nothing has been created.
+  Read the error next to each name:
+    users_not_found  → not in the workspace yet, or their Slack email differs
+                       from the CSV. Fix the CSV or chase the invite.
+    missing_scope    → the bot token lacks users:read.email. Add it in the app's
+                       OAuth & Permissions page and reinstall the app.
+    invalid_auth     → the token is wrong or was revoked.
+  Fix, then re-run.
 HINT
     exit 1
   fi
