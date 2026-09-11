@@ -31,7 +31,7 @@ exec $SHELL -l
 ai4dev version
 ```
 
-Then create your configuration from the example and lock it down. The gateway URL is `https://aiproxy.ai4dev.dev/v1`; the dashboard URL is on Slack. **Leave the key line empty** — the key is issued in the room on day 1.
+Then create your configuration from the example and lock it down. The gateway URL is `https://aiproxy.ai4dev.dev/v1`; the dashboard is `https://langfuse.ai4dev.dev`. **Leave the key line empty** — the key is issued in the room on day 1.
 
 ```bash
 mkdir -p ~/.config/ai4dev

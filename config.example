@@ -14,7 +14,7 @@
 AI4DEV_API_KEY=""
 
 AI4DEV_GATEWAY_URL="https://aiproxy.ai4dev.dev/v1"
-AI4DEV_DASHBOARD_URL="https://<cohort-dashboard>"
+AI4DEV_DASHBOARD_URL="https://langfuse.ai4dev.dev"
 
 # Where 'ai4dev init' clones the course repositories.
 AI4DEV_WORKSPACE="$HOME/ai4dev"

@@ -6,3 +6,6 @@ reviews/
 
 cohort.csv
 keys.csv
+
+# participant data never belongs in the participant kit
+*.csv
