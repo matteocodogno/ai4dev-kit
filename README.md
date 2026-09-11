@@ -22,14 +22,16 @@ Nothing in here is product code. Nothing in a product repository is a copy of wh
 
 ## Install
 
+**On Windows, do all of this inside WSL2 with Ubuntu**, not in PowerShell and not in Git Bash. The tool is a bash script and it checks Unix file permissions; inside WSL2 everything below behaves exactly as it does on a Mac.
+
 ```bash
 git clone https://github.com/matteocodogno/ai4dev-kit.git ~/ai4dev-kit
-echo 'export PATH="$HOME/ai4dev-kit/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc
+echo 'export PATH="$HOME/ai4dev-kit/bin:$PATH"' >> ~/.zshrc   # Ubuntu/WSL2: ~/.bashrc
 exec $SHELL -l
 ai4dev version
 ```
 
-Then create your configuration from the example and lock it down. Fill in the two URLs from Slack and **leave the key line empty** — the key is issued in the room on day 1.
+Then create your configuration from the example and lock it down. The gateway URL is `https://aiproxy.ai4dev.dev/v1`; the dashboard URL is on Slack. **Leave the key line empty** — the key is issued in the room on day 1.
 
 ```bash
 mkdir -p ~/.config/ai4dev

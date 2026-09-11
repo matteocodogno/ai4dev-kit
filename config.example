@@ -13,7 +13,7 @@
 # Never share it, never commit it, never paste it into a channel.
 AI4DEV_API_KEY=""
 
-AI4DEV_GATEWAY_URL="https://<cohort-gateway>/v1"
+AI4DEV_GATEWAY_URL="https://aiproxy.ai4dev.dev/v1"
 AI4DEV_DASHBOARD_URL="https://<cohort-dashboard>"
 
 # Where 'ai4dev init' clones the course repositories.
