@@ -11,11 +11,12 @@
 #   ai4dev review <file>   review a file with YOUR review prompt, from this kit
 #   ai4dev commit          write a commit message from the staged diff
 #   ai4dev costs           your spend, your remaining budget, where your traces are
-#   ai4dev key             re-fetch your virtual key from the secret manager
+#   ai4dev key             check that your virtual key is present and usable
 #   ai4dev config          show the resolved configuration
 #
 # Config resolution: environment > ~/.config/ai4dev/config > defaults.
-# The virtual key is never written to disk by this script.
+# Your virtual key lives in that config file, which must be mode 600. This
+# script never prints it in full and never copies it anywhere.
 
 set -euo pipefail
 
@@ -49,7 +50,6 @@ load_config() {
   AI4DEV_WORKSPACE="${AI4DEV_WORKSPACE:-$HOME/ai4dev}"
   AI4DEV_GATEWAY_URL="${AI4DEV_GATEWAY_URL:-}"
   AI4DEV_DASHBOARD_URL="${AI4DEV_DASHBOARD_URL:-}"
-  AI4DEV_SECRET_REF="${AI4DEV_SECRET_REF:-AI4DEV_API_KEY}"
   AI4DEV_GIT_BASE="${AI4DEV_GIT_BASE:-git@github.com:aiscream}"
   AI4DEV_START_TAG="${AI4DEV_START_TAG:-module-01-start}"
 }
@@ -60,27 +60,26 @@ require_gateway() {
 
 # ─── the virtual key ─────────────────────────────────────────────────────────
 #
-# Fetched from the secret manager on every invocation and held in memory only.
+# It arrives by Slack DM and you paste it into the config file. That is a
+# deliberate choice, not a shortcut: this key is capped at a fixed budget, lives
+# only as long as the course, and is revoked with one call. A credential whose
+# blast radius is bounded does not need the ceremony a production key needs.
+#
+# That reasoning is the lesson. Apply it to your own provider keys and check
+# whether it still holds. Usually it does not, and that is the point.
+#
 # It is a gateway-issued virtual key, not a provider key: it carries your
-# identity and your budget, and it cannot talk to a provider directly.
+# identity and your budget, and it cannot reach a provider directly.
 
 fetch_key() {
-  local key=""
+  [[ -n "${AI4DEV_API_KEY:-}" ]] || return 1
+  printf '%s' "$AI4DEV_API_KEY"
+}
 
-  if [[ -n "${AI4DEV_API_KEY:-}" ]]; then
-    printf '%s' "$AI4DEV_API_KEY"; return 0
-  fi
-
-  if command -v infisical >/dev/null 2>&1; then
-    key="$(infisical secrets get "$AI4DEV_SECRET_REF" --plain 2>/dev/null || true)"
-  fi
-
-  if [[ -z "$key" ]] && command -v op >/dev/null 2>&1; then
-    key="$(op read "op://AI4Dev/$AI4DEV_SECRET_REF/credential" 2>/dev/null || true)"
-  fi
-
-  [[ -n "$key" ]] || return 1
-  printf '%s' "$key"
+# The config file holds the key, so its permissions are part of the environment.
+config_mode() {
+  [[ -f "$CONFIG_FILE" ]] || { printf 'missing'; return; }
+  stat -f '%Lp' "$CONFIG_FILE" 2>/dev/null || stat -c '%a' "$CONFIG_FILE" 2>/dev/null || printf 'unknown'
 }
 
 # ─── gateway call ────────────────────────────────────────────────────────────
@@ -207,15 +206,14 @@ cmd_doctor() {
     bad "no container runtime is running" "start OrbStack, Docker Desktop or Podman. Only needed for the product database."
   fi
 
-  # secret manager
-  if command -v infisical >/dev/null 2>&1; then
-    if infisical user get >/dev/null 2>&1; then ok "secret manager authenticated (infisical)"
-    else bad "secret manager not logged in" "infisical login"; fi
-  elif command -v op >/dev/null 2>&1; then
-    ok "secret manager present (1password)"
-  else
-    bad "no secret manager CLI found" "install the Infisical CLI and run 'infisical login'"
-  fi
+  # config file — it holds your key, so its permissions are part of the check
+  local mode; mode="$(config_mode)"
+  case "$mode" in
+    missing) bad "no config file at $CONFIG_FILE" "copy config.example from your kit into it" ;;
+    600|400) ok  "config file $CONFIG_FILE (mode $mode)" ;;
+    *)       bad "config file is readable by others (mode $mode)" \
+                 "chmod 600 $CONFIG_FILE  — your virtual key is in it" ;;
+  esac
 
   # kit and workspace
   if [[ -f "$AI4DEV_KIT/prompts/code_review.md" ]]; then ok "kit at $AI4DEV_KIT"
@@ -233,9 +231,10 @@ cmd_doctor() {
   printf '\n'
   local key
   if key="$(fetch_key)"; then
-    ok "virtual key retrieved (${key:0:7}…)"
+    ok "virtual key present (${key:0:7}…)"
   else
-    bad "could not retrieve your virtual key" "your key may not be issued yet. Ask on Slack. Never create your own."
+    bad "AI4DEV_API_KEY is not set" \
+        "it was sent to you by Slack DM. Paste it into $CONFIG_FILE. Never invent your own."
     printf '\n%s✗ doctor failed%s\n' "$R" "$N"; exit 1
   fi
 
@@ -331,13 +330,20 @@ cmd_costs() {
 
 cmd_key() {
   load_config
-  local key
+  local key mode
+  mode="$(config_mode)"
   if key="$(fetch_key)"; then
-    ok "virtual key retrieved (${key:0:7}…)"
-    info "Held in memory only. This script never writes it to disk."
+    ok "virtual key present (${key:0:7}…)"
+    if [[ "$mode" == "600" || "$mode" == "400" ]]; then
+      info "in $CONFIG_FILE, mode $mode. Never printed in full, here or anywhere else."
+    else
+      warn "$CONFIG_FILE is mode $mode — anyone on this machine can read your key"
+      info "chmod 600 $CONFIG_FILE"
+    fi
   else
-    printf '%s✗%s could not retrieve your virtual key\n' "$R" "$N"
-    info "check your secret manager login, then ask on Slack"
+    printf '%s✗%s AI4DEV_API_KEY is not set\n' "$R" "$N"
+    info "it was sent to you by Slack DM. Paste it into $CONFIG_FILE."
+    info "if you never received it, or you have lost it, ask on Slack for a new one."
     exit 1
   fi
 }
@@ -349,11 +355,11 @@ cmd_config() {
   printf '  AI4DEV_WORKSPACE     %s\n' "$AI4DEV_WORKSPACE"
   printf '  AI4DEV_GATEWAY_URL   %s\n' "${AI4DEV_GATEWAY_URL:-<unset>}"
   printf '  AI4DEV_DASHBOARD_URL %s\n' "${AI4DEV_DASHBOARD_URL:-<unset>}"
-  printf '  AI4DEV_SECRET_REF    %s\n' "$AI4DEV_SECRET_REF"
   printf '  AI4DEV_GIT_BASE      %s\n' "$AI4DEV_GIT_BASE"
   printf '  AI4DEV_START_TAG     %s\n' "$AI4DEV_START_TAG"
+  printf '  AI4DEV_API_KEY       %s\n' "$([[ -n "${AI4DEV_API_KEY:-}" ]] && printf '%s…  (config mode %s)' "${AI4DEV_API_KEY:0:7}" "$(config_mode)" || printf '<unset>')"
   printf '\n'
-  info "The virtual key is not here. It is fetched from the secret manager on every call."
+  info "Only the first characters of your key are ever shown, here or anywhere else."
 }
 
 usage() {
@@ -365,7 +371,7 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
   ai4dev review <file>   review a file with your review prompt, from your kit
   ai4dev commit          write a commit message from the staged diff
   ai4dev costs           your spend, your remaining budget, where your traces are
-  ai4dev key             re-fetch your virtual key from the secret manager
+  ai4dev key             check that your virtual key is present and usable
   ai4dev config          show the resolved configuration
 
 This script lives in your kit. Edit prompts/code_review.md and the behaviour of
