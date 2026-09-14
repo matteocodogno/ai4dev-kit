@@ -26,7 +26,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.2.0"
+readonly AI4DEV_VERSION="1.3.0"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -588,6 +588,9 @@ cmd_costs() {
 cmd_upgrade() {
   load_config
 
+  local force=0
+  [[ "${1:-}" == "--force" ]] && force=1
+
   local kit="$KIT_ROOT"
   [[ -d "$kit/.git" ]] || die "$kit is not a git repository. Re-clone your kit and copy your work across."
   git -C "$kit" remote get-url origin >/dev/null 2>&1 || die "this kit has no 'origin' remote, so there is nothing to upgrade from."
@@ -612,6 +615,29 @@ cmd_upgrade() {
     return 0
   fi
 
+  # "Different from origin" is not the same as "older than origin". If your
+  # branch carries commits to the tool that the course repository has not seen,
+  # taking origin's copy is a DOWNGRADE, and the command would announce it as an
+  # upgrade. That happened once, to the person who wrote this command, because
+  # he had not pushed. Stop instead.
+  local ahead
+  ahead="$(git -C "$kit" log --oneline origin/main..HEAD -- "${COURSE_OWNED[@]}" 2>/dev/null || true)"
+  if [[ -n "$ahead" && "$force" -eq 0 ]]; then
+    bad "your copy of the tool is ahead of the course repository"
+    printf '\n'
+    printf '%s\n' "$ahead" | while IFS= read -r commit_line; do
+      [[ -n "$commit_line" ]] || continue
+      printf '  %s%s%s\n' "$D" "$commit_line" "$N"
+    done
+    printf '\n'
+    info "Those commits touch ${COURSE_OWNED[*]} and origin/main does not have them."
+    info "Upgrading now would replace newer files with older ones."
+    printf '\n'
+    info "If they are yours and belong upstream:  git push"
+    info "If you really want the course's version: ai4dev upgrade --force"
+    exit 1
+  fi
+
   printf '\n%sthis will replace:%s\n' "$B" "$N"
   printf '  %s\n' $changed
   printf '\n'
@@ -625,8 +651,20 @@ cmd_upgrade() {
   # the last line of the file has been read), so finishing is safe — but the NEW
   # version has to be asked for its version by running it, not by reading
   # AI4DEV_VERSION, which is still the old value in this process.
-  local now; now="$("$kit/bin/ai4dev" version 2>/dev/null || echo "ai4dev ?")"
-  ok "upgraded: was ai4dev $AI4DEV_VERSION, now $now"
+  local before="$AI4DEV_VERSION" after
+  after="$("$kit/bin/ai4dev" version 2>/dev/null | awk '{print $2}')"
+  [[ -n "$after" ]] || after="?"
+
+  if [[ "$after" == "$before" ]]; then
+    ok "tool files updated — still ai4dev $before"
+  elif [[ "$after" == "?" ]]; then
+    warn "tool files updated, but the new version does not run. Check 'ai4dev version'."
+  elif [[ "$(printf '%s\n%s\n' "$before" "$after" | sort -V | tail -1)" == "$after" ]]; then
+    ok "upgraded: ai4dev $before → $after"
+  else
+    warn "DOWNGRADED: ai4dev $before → $after"
+    info "That is what the course repository currently holds. If it should be newer, it was never pushed."
+  fi
   info "Your prompts, checklists, decisions and notes were not touched."
 }
 
@@ -678,6 +716,7 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
   ai4dev key             check that your virtual key is present and usable
   ai4dev config          show the resolved configuration
   ai4dev upgrade         update the tool from the course, leaving your work alone
+                         (--force to take the course's copy even when yours is newer)
 
 ask takes:
   --model <alias>        frontier · cheap · open-hosted · reviewer · committer …
