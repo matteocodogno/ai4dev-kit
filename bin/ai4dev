@@ -26,7 +26,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.3.0"
+readonly AI4DEV_VERSION="1.3.1"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -505,9 +505,21 @@ cmd_ask() {
   [[ -z "$temp" || "$temp" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--temp must be a number, for example 0.0 or 1.0."
 
   local i total="0"
+  local answer
   for ((i = 1; i <= n; i++)); do
     [[ "$n" -gt 1 ]] && printf '\n%s── run %d of %d ─────────────────────────────%s\n' "$D" "$i" "$n" "$N"
-    printf '\n%s\n\n' "$(call "$model" "$prompt" "task=ask" "$temp")"
+
+    # The status of the call has to be checked, not assumed. call() runs in a
+    # command substitution, so its failure does not stop the surrounding
+    # printf — and the footer, which reads the last line of the ledger, would
+    # then print the PREVIOUS request's tokens and cost under a request that
+    # never happened and never cost anything. A number attached to the wrong
+    # thing is worse than no number.
+    if ! answer="$(call "$model" "$prompt" "task=ask" "$temp")"; then
+      exit 1
+    fi
+
+    printf '\n%s\n\n' "$answer"
     last_call_footer
     total="$(awk -v a="$total" -v b="$(last_call_cost)" 'BEGIN{printf "%.6f", a+b}')"
   done
