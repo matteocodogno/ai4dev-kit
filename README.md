@@ -58,14 +58,11 @@ Before day 1 it will report **`no virtual key yet`** in yellow and, if everythin
 | --- | --- |
 | `ai4dev init` | Clones the course repositories into `~/ai4dev` |
 | `ai4dev doctor` | Verifies the environment. With a key, makes one real request; without one, says *ready for day 1* |
-| `ai4dev ask <prompt>` | Asks an alias directly and tells you what the answer cost |
 | `ai4dev review <file>` | Reviews a file with **your** review prompt |
 | `ai4dev commit` | Writes a commit message from the staged diff |
 | `ai4dev costs` | Your spend, your remaining budget, where your traces are |
-| `ai4dev costs --last N` | The last N requests: tokens in and out, cost, latency, which model answered |
 | `ai4dev key` | Checks that your virtual key is present and your config file is locked down |
 | `ai4dev config` | Shows the resolved configuration |
-| `ai4dev upgrade` | Updates the tool from the course, and touches nothing else |
 
 Three things worth knowing about how it works:
 
@@ -79,53 +76,6 @@ Three things worth knowing about how it works:
 
 ---
 
-## `ask`, and the ledger behind it
-
-`review` and `commit` send a prompt from this kit. `ask` sends exactly what you typed, to exactly the alias you named, and then tells you what it cost. It is the command for measuring a model rather than using one.
-
-```bash
-ai4dev ask "In two sentences: why might a Chihuahua and a Husky be a poor match?"
-ai4dev ask --model cheap --temp 0.0 --n 5 "…"
-ai4dev ask --model open-hosted --prompt-file brief.md
-```
-
-| Flag | What it does |
-| --- | --- |
-| `--model <alias>` | `frontier`, `cheap`, `open-hosted`, `reviewer`, `committer`, … Still an alias, never a model name |
-| `--temp <n>` | Sent **only if you pass it**. Some aliases reject it outright, and when that happens the error explains why rather than hiding it |
-| `--n <count>` | Run the same prompt 1 to 20 times. The point is to watch what changes between runs |
-| `--prompt-file <path>` | Read the prompt from a file |
-
-Every request the tool makes is appended to `~/.local/state/ai4dev/usage.jsonl`, and `ai4dev costs --last 3` reads it back:
-
-```
-when (UTC)           alias        model that answered             in     out       cost    secs
-2026-09-17T09:41:02  frontier     anthropic/claude-sonnet-5     1083     241   0.000369    7.39
-2026-09-17T09:42:40  cheap        openai/gpt-5.6-luna           1083     198   0.000041    1.82
-```
-
-You now have three records of the same request and they do not say the same thing. The gateway knows what it charged you. The dashboard knows what was sent and what came back. This file knows **how long you waited**, which neither of the other two can see, because latency is a property of where you are standing. Notice which question each one can answer, and which one you reach for.
-
-The file is yours and it is local. Deleting it loses nothing the gateway does not still have.
-
----
-
-## `upgrade`, and why it is not `git pull`
-
-This kit holds two different things: a tool the course ships and keeps changing, and work that is yours from Kit Zero onward. From Module 2 your branch has commits the course does not have, so a fast-forward pull is not even on the table, and a merge would make you resolve a conflict between the course's tool and your own history.
-
-`ai4dev upgrade` does not pull. It takes the **course-owned paths** — `bin/`, `README.md`, `config.example` — from the course's `main` and commits only those.
-
-```bash
-ai4dev upgrade
-```
-
-Your prompts, checklists, decisions and notes are never touched, so there is nothing to resolve: the two sets of files do not overlap. If you have uncommitted edits to a course-owned file, it stops and tells you instead of overwriting them.
-
-Note what this means for `prompts/`. The course seeds those files once and then they are yours — Module 3 has you rewrite `code_review.md`, and an upgrade must never undo that. That is why `prompts/` is not on the list.
-
----
-
 ## Layout
 
 ```
@@ -135,7 +85,6 @@ ai4dev-kit/
 ├── prompts/              your prompts          — Module 1 onward
 │   ├── code_review.md
 │   └── commit_message.md
-├── decisions/            your decision records — Module 2 onward
 ├── skills/               your skills           — Module 3
 ├── checklists/           your checklists       — Module 1 onward
 ├── rubrics/              your eval rubrics     — Module 9
