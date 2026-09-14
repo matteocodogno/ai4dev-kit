@@ -102,6 +102,18 @@ config_mode() {
   printf '%s' "$m"
 }
 
+# participant: the name every request is attributed to.
+#
+# It comes from your git identity, which 'ai4dev doctor' insists you configure
+# with your real name. The same name signs your commits and your AI requests,
+# which is the point: one identity, two ledgers.
+participant() {
+  local n
+  n="$(git config --global user.name 2>/dev/null || true)"
+  [[ -n "$n" ]] || n="${USER:-unknown}"
+  printf '%s' "$n"
+}
+
 # ─── gateway call ────────────────────────────────────────────────────────────
 #
 # call <role> <prompt> [k=v,k=v]
@@ -119,8 +131,25 @@ call() {
   if [[ -n "$meta" ]]; then
     meta_json="$(printf '%s' "$meta" | jq -R 'split(",") | map(split("=") | {(.[0]): .[1]}) | add')"
   fi
-  meta_json="$(jq -n --argjson m "$meta_json" --arg u "${USER:-unknown}" \
-                     '$m + {user: $u, source: "ai4dev-cli"}')"
+
+  # Two of these keys are not decoration. The gateway forwards request metadata
+  # to the observability backend, which reads exactly two names:
+  #
+  #   trace_user_id  -> who this request belongs to. Without it every trace is
+  #                     attributed to "n/a" and the cohort dashboard is a single
+  #                     anonymous bar.
+  #   trace_name     -> what the request was for. Without it the dashboard ranks
+  #                     HTTP routes instead of work.
+  #
+  # Renaming either one silently breaks attribution while everything still
+  # appears to work. That is the whole lesson, and it is one line of JSON.
+  local task; task="$(printf '%s' "$meta_json" | jq -r '.task // empty')"
+  [[ -n "$task" ]] || task="$role"
+
+  meta_json="$(jq -n --argjson m "$meta_json" \
+                     --arg who "$(participant)" \
+                     --arg name "ai4dev $task" \
+                     '$m + {trace_user_id: $who, trace_name: $name, source: "ai4dev-cli"}')"
 
   local payload
   payload="$(jq -n --arg model "$role" --arg content "$prompt" --argjson metadata "$meta_json" \
