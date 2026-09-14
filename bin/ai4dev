@@ -10,11 +10,15 @@
 #   ai4dev doctor          verify everything; with a key, make one real request
 #                          (before day 1 there is no key yet — that is expected,
 #                           and doctor reports "ready for day 1" instead of red)
+#   ai4dev ask <prompt>    ask a model alias directly — the raw loop, no prompt
+#                          template in the way. --model, --temp, --n, --prompt-file
 #   ai4dev review <file>   review a file with YOUR review prompt, from this kit
 #   ai4dev commit          write a commit message from the staged diff
 #   ai4dev costs           your spend, your remaining budget, where your traces are
+#   ai4dev costs --last N  the last N requests: tokens, cost, latency, which model
 #   ai4dev key             check that your virtual key is present and usable
 #   ai4dev config          show the resolved configuration
+#   ai4dev upgrade         update the tool from the course, leaving your work alone
 #
 # Config resolution: environment > ~/.config/ai4dev/config > defaults.
 # Your virtual key lives in that config file, which must be mode 600. This
@@ -22,7 +26,12 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.0.0"
+readonly AI4DEV_VERSION="1.2.0"
+
+# The parts of this kit the COURSE owns and may replace. Everything else in
+# here is yours: your prompts once you have edited them, your checklists, your
+# decisions, your notes. 'ai4dev upgrade' updates this list and nothing else.
+readonly COURSE_OWNED=(bin README.md config.example)
 readonly CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ai4dev/config"
 
 # The kit is this script's own repository: bin/ai4dev -> repo root.
@@ -102,6 +111,18 @@ config_mode() {
   printf '%s' "$m"
 }
 
+# participant: the name every request is attributed to.
+#
+# It comes from your git identity, which 'ai4dev doctor' insists you configure
+# with your real name. The same name signs your commits and your AI requests,
+# which is the point: one identity, two ledgers.
+participant() {
+  local n
+  n="$(git config --global user.name 2>/dev/null || true)"
+  [[ -n "$n" ]] || n="${USER:-unknown}"
+  printf '%s' "$n"
+}
+
 # ─── gateway call ────────────────────────────────────────────────────────────
 #
 # call <role> <prompt> [k=v,k=v]
@@ -109,8 +130,56 @@ config_mode() {
 # architect, tester). You never name a model here: which model answers is an
 # infrastructure decision made by somebody else, and that is the point.
 
+# ─── the ledger ──────────────────────────────────────────────────────────────
+#
+# Every request this CLI makes is appended here, one JSON object per line.
+#
+# There are now three records of the same request, and they do not say the same
+# thing. The gateway knows what it charged you. The dashboard knows what was
+# sent and what came back. This file knows how long *you* waited, which neither
+# of the other two can see, because latency is a property of where you are
+# standing. 'ai4dev costs --last' reads this one.
+#
+# It is yours, it is local, and deleting it loses nothing the gateway has.
+readonly LEDGER="${XDG_STATE_HOME:-$HOME/.local/state}/ai4dev/usage.jsonl"
+
+# Set by call() while it runs, and used by it to write the ledger line. They do
+# NOT survive back to the caller: call() is invoked in a command substitution,
+# which is a subshell, and a subshell cannot assign to its parent's variables.
+# Anything that wants the last call's numbers reads the ledger, which is a file
+# and therefore does survive. That is what last_call_footer does.
+LAST_ALIAS=""; LAST_MODEL=""; LAST_IN=0; LAST_OUT=0; LAST_COST=0; LAST_LATENCY=0
+
+header_value() {
+  # header_value <file> <header-name>
+  # Case-insensitive, tolerates the CR, prints nothing when the header is absent.
+  tr -d '\r' < "$1" | awk -v want="$2" '
+    { i = index($0, ":")
+      if (i == 0) next
+      if (tolower(substr($0, 1, i - 1)) == tolower(want)) {
+        v = substr($0, i + 1); sub(/^ +/, "", v); print v
+      } }' | tail -1
+}
+
+ledger_append() {
+  mkdir -p "$(dirname "$LEDGER")"
+  jq -n -c \
+    --arg when     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg alias    "$LAST_ALIAS" \
+    --arg model    "$LAST_MODEL" \
+    --arg temp     "${1:-}" \
+    --argjson tin  "$LAST_IN" \
+    --argjson tout "$LAST_OUT" \
+    --argjson cost "$LAST_COST" \
+    --argjson lat  "$LAST_LATENCY" \
+    '{when: $when, alias: $alias, model: $model,
+      temperature: (if $temp == "" then null else ($temp|tonumber) end),
+      tokens_in: $tin, tokens_out: $tout, cost: $cost, latency_s: $lat}' \
+    >> "$LEDGER"
+}
+
 call() {
-  local role="$1" prompt="$2" meta="${3:-}"
+  local role="$1" prompt="$2" meta="${3:-}" temp="${4:-}"
   require_gateway
 
   local key; key="$(fetch_key)" || die "no virtual key configured. Paste the one from your Slack DM into $CONFIG_FILE, then run 'ai4dev doctor'."
@@ -119,24 +188,93 @@ call() {
   if [[ -n "$meta" ]]; then
     meta_json="$(printf '%s' "$meta" | jq -R 'split(",") | map(split("=") | {(.[0]): .[1]}) | add')"
   fi
-  meta_json="$(jq -n --argjson m "$meta_json" --arg u "${USER:-unknown}" \
-                     '$m + {user: $u, source: "ai4dev-cli"}')"
+
+  # Two of these keys are not decoration. The gateway forwards request metadata
+  # to the observability backend, which reads exactly two names:
+  #
+  #   trace_user_id  -> who this request belongs to. Without it every trace is
+  #                     attributed to "n/a" and the cohort dashboard is a single
+  #                     anonymous bar.
+  #   trace_name     -> what the request was for. Without it the dashboard ranks
+  #                     HTTP routes instead of work.
+  #
+  # Renaming either one silently breaks attribution while everything still
+  # appears to work. That is the whole lesson, and it is one line of JSON.
+  local task; task="$(printf '%s' "$meta_json" | jq -r '.task // empty')"
+  [[ -n "$task" ]] || task="$role"
+
+  meta_json="$(jq -n --argjson m "$meta_json" \
+                     --arg who "$(participant)" \
+                     --arg name "ai4dev $task" \
+                     '$m + {trace_user_id: $who, trace_name: $name, source: "ai4dev-cli"}')"
 
   local payload
+  # temperature is sent ONLY when you asked for it. A CLI that always sends a
+  # "safe" default is the liability Module 2 Part 1 describes: it works until
+  # the alias is repointed at a reasoning model, and then it is a hard 400 on a
+  # call whose code never changed.
   payload="$(jq -n --arg model "$role" --arg content "$prompt" --argjson metadata "$meta_json" \
     '{model: $model, messages: [{role: "user", content: $content}], metadata: $metadata}')"
-
-  local response
-  response="$(curl -sS --fail-with-body -X POST "$AI4DEV_GATEWAY_URL/chat/completions" \
-    -H "Authorization: Bearer $key" \
-    -H "Content-Type: application/json" \
-    -d "$payload")" || die "the gateway refused the request. Run 'ai4dev doctor'."
-
-  if printf '%s' "$response" | jq -e '.error' >/dev/null 2>&1; then
-    die "$(printf '%s' "$response" | jq -r '.error.message // .error')"
+  if [[ -n "$temp" ]]; then
+    payload="$(printf '%s' "$payload" | jq --argjson t "$temp" '. + {temperature: $t}')"
   fi
 
+  local body_file hdr_file
+  body_file="$(mktemp)"; hdr_file="$(mktemp)"
+  trap 'rm -f "$body_file" "$hdr_file"' RETURN
+
+  local meta_out http_code
+  meta_out="$(curl -sS -o "$body_file" -D "$hdr_file" -w '%{http_code} %{time_total}' \
+    -X POST "$AI4DEV_GATEWAY_URL/chat/completions" \
+    -H "Authorization: Bearer $key" \
+    -H "Content-Type: application/json" \
+    -d "$payload")" || die "could not reach the gateway. Run 'ai4dev doctor'."
+
+  http_code="${meta_out%% *}"
+  LAST_LATENCY="${meta_out##* }"
+
+  local response; response="$(cat "$body_file")"
+
+  if [[ "$http_code" != "200" ]] || printf '%s' "$response" | jq -e '.error' >/dev/null 2>&1; then
+    local msg; msg="$(printf '%s' "$response" | jq -r '.error.message // .error // .' 2>/dev/null || printf '%s' "$response")"
+
+    # One error deserves a real explanation rather than a stack trace, because
+    # it is a lesson and not a bug.
+    if [[ -n "$temp" && "$msg" == *emperature* ]]; then
+      printf '%serror:%s the alias %s'"'"'%s'"'"'%s does not accept temperature=%s.\n\n' "$R" "$N" "$B" "$role" "$N" "$temp" >&2
+      printf '  Reasoning models take only their default temperature. Sending one is\n' >&2
+      printf '  rejected outright, and nothing about your request was wrong yesterday.\n\n' >&2
+      printf '  This is not something to work around by making the CLI drop the\n' >&2
+      printf '  parameter quietly: that would hide the fact that your setting was\n' >&2
+      printf '  never honoured. Run it without --temp, or against another alias.\n' >&2
+      exit 1
+    fi
+    die "$msg"
+  fi
+
+  LAST_ALIAS="$role"
+  LAST_MODEL="$(header_value "$hdr_file" x-litellm-model-name)"
+  [[ -n "$LAST_MODEL" ]] || LAST_MODEL="$(printf '%s' "$response" | jq -r '.model // "unknown"')"
+  LAST_IN="$( printf '%s' "$response" | jq -r '.usage.prompt_tokens     // 0')"
+  LAST_OUT="$(printf '%s' "$response" | jq -r '.usage.completion_tokens // 0')"
+  LAST_COST="$(header_value "$hdr_file" x-litellm-response-cost)"
+  [[ "$LAST_COST" =~ ^[0-9.eE+-]+$ ]] || LAST_COST=0
+
+  ledger_append "$temp"
+
   printf '%s' "$response" | jq -r '.choices[0].message.content'
+}
+
+last_call_footer() {
+  [[ -f "$LEDGER" ]] || return 0
+  local line
+  line="$(tail -n 1 "$LEDGER" | jq -r '"\(.tokens_in) in · \(.tokens_out) out · $\(.cost) · \(.latency_s)s · \(.model)"')"
+  printf '%s  %s%s\n' "$D" "$line" "$N"
+}
+
+last_call_cost() {
+  [[ -f "$LEDGER" ]] || { printf '0'; return 0; }
+  tail -n 1 "$LEDGER" | jq -r '.cost // 0'
 }
 
 render() {
@@ -336,7 +474,78 @@ cmd_commit() {
   fi
 }
 
+# ask — the loop with nothing in front of it.
+#
+# 'review' and 'commit' send a prompt from your kit. 'ask' sends exactly what
+# you typed, to exactly the alias you named, and tells you what it cost. It is
+# the command you use when you are measuring the model rather than using it.
+cmd_ask() {
+  load_config
+
+  local model="frontier" temp="" n=1 prompt_file="" prompt=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model)            model="${2:-}";       shift 2 ;;
+      --temp|--temperature) temp="${2:-}";      shift 2 ;;
+      --n|-n)             n="${2:-}";           shift 2 ;;
+      --prompt-file)      prompt_file="${2:-}"; shift 2 ;;
+      --)                 shift; prompt="$*";   break   ;;
+      -*)                 die "unknown option: $1" ;;
+      *)                  prompt="$*";          break   ;;
+    esac
+  done
+
+  if [[ -n "$prompt_file" ]]; then
+    [[ -f "$prompt_file" ]] || die "no such prompt file: $prompt_file"
+    prompt="$(cat "$prompt_file")"
+  fi
+  [[ -n "$prompt" ]] || die "nothing to ask. Give a prompt, or --prompt-file <path>."
+  [[ -n "$model" ]]  || die "--model needs an alias: frontier, cheap, open-hosted, reviewer, …"
+  [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 && "$n" -le 20 ]] || die "--n must be a whole number from 1 to 20."
+  [[ -z "$temp" || "$temp" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--temp must be a number, for example 0.0 or 1.0."
+
+  local i total="0"
+  for ((i = 1; i <= n; i++)); do
+    [[ "$n" -gt 1 ]] && printf '\n%s── run %d of %d ─────────────────────────────%s\n' "$D" "$i" "$n" "$N"
+    printf '\n%s\n\n' "$(call "$model" "$prompt" "task=ask" "$temp")"
+    last_call_footer
+    total="$(awk -v a="$total" -v b="$(last_call_cost)" 'BEGIN{printf "%.6f", a+b}')"
+  done
+
+  if [[ "$n" -gt 1 ]]; then
+    printf '\n%s%d runs · $%s total%s\n' "$D" "$n" "$total" "$N"
+    info "Same prompt, same alias, same settings. Read them before you explain them."
+  fi
+}
+
 cmd_costs() {
+  # --last reads your own ledger, not the gateway: it is the only one of the
+  # three records that knows how long you waited.
+  if [[ "${1:-}" == "--last" ]]; then
+    local n="${2:-1}"
+    [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 ]] || die "--last takes a whole number, for example: ai4dev costs --last 3"
+    [[ -f "$LEDGER" ]] || die "no requests recorded yet on this machine. Make one, then ask again."
+
+    printf '\n%s%-20s %-12s %-26s %7s %7s %10s %7s%s\n' "$B" \
+      "when (UTC)" "alias" "model that answered" "in" "out" "cost" "secs" "$N"
+
+    tail -n "$n" "$LEDGER" \
+      | jq -r '[.when, .alias, (.model // "?"), (.tokens_in|tostring), (.tokens_out|tostring),
+                (.cost|tostring), (.latency_s|tostring)] | @tsv' \
+      | while IFS=$'\t' read -r when alias model tin tout cost lat; do
+          printf '%-20s %-12s %-26.26s %7s %7s %10.6f %7.2f\n' \
+            "${when%Z}" "$alias" "$model" "$tin" "$tout" "$cost" "$lat"
+        done
+
+    local sum count
+    count="$(tail -n "$n" "$LEDGER" | wc -l | tr -d ' ')"
+    sum="$(tail -n "$n" "$LEDGER" | jq -s 'map(.cost) | add // 0' | awk '{printf "%.6f", $0}')"
+    printf '\n%s  $%s across the last %s request%s%s\n' "$D" "$sum" "$count" \
+      "$([[ "$count" -eq 1 ]] || printf s)" "$N"
+    info "The gateway charged you this. The dashboard can show you what you sent for it."
+    return 0
+  fi
+
   load_config
   require_gateway
   local brief=0; [[ "${1:-}" == "--brief" ]] && brief=1
@@ -363,6 +572,62 @@ cmd_costs() {
   printf '\n'
   info "Your traces: ${AI4DEV_DASHBOARD_URL:-<dashboard URL not configured>}"
   info "Open one and find four things: input tokens, output tokens, cost, and exactly what was sent."
+}
+
+# upgrade — update the tool, not your work.
+#
+# The kit is one repository holding two different things: a tool the course
+# ships and keeps changing, and work that is yours from Kit Zero onward. A
+# 'git pull' cannot tell them apart, and by Module 2 your branch has diverged
+# from the course's anyway, so a fast-forward is not even available.
+#
+# So this does not pull. It checks out the course-owned paths from origin/main
+# and commits only those. Your prompts, checklists, decisions and notes are
+# never touched, and there is no merge to resolve because the two sets of files
+# do not overlap.
+cmd_upgrade() {
+  load_config
+
+  local kit="$KIT_ROOT"
+  [[ -d "$kit/.git" ]] || die "$kit is not a git repository. Re-clone your kit and copy your work across."
+  git -C "$kit" remote get-url origin >/dev/null 2>&1 || die "this kit has no 'origin' remote, so there is nothing to upgrade from."
+
+  # Your own edits to a course-owned file would be overwritten. Stop instead.
+  if ! git -C "$kit" diff --quiet -- "${COURSE_OWNED[@]}" 2>/dev/null \
+     || ! git -C "$kit" diff --cached --quiet -- "${COURSE_OWNED[@]}" 2>/dev/null; then
+    bad "you have uncommitted changes in ${COURSE_OWNED[*]}"
+    info "commit or stash them first: the upgrade would overwrite them."
+    exit 1
+  fi
+
+  info "fetching from $(git -C "$kit" remote get-url origin)"
+  git -C "$kit" fetch --quiet origin main 2>/dev/null \
+    || die "could not reach the course repository. Check your network, then try again."
+
+  local changed
+  changed="$(git -C "$kit" diff --name-only HEAD origin/main -- "${COURSE_OWNED[@]}" 2>/dev/null || true)"
+
+  if [[ -z "$changed" ]]; then
+    ok "already up to date — ai4dev $AI4DEV_VERSION"
+    return 0
+  fi
+
+  printf '\n%sthis will replace:%s\n' "$B" "$N"
+  printf '  %s\n' $changed
+  printf '\n'
+
+  git -C "$kit" checkout origin/main -- "${COURSE_OWNED[@]}"
+  git -C "$kit" commit --quiet -m "kit: update the ai4dev tool from the course" -- "${COURSE_OWNED[@]}" \
+    || info "nothing to commit — the files were already staged as they are"
+
+  # This script has just overwritten itself while running. Bash has already read
+  # and parsed everything it needs (every command lives inside a function, and
+  # the last line of the file has been read), so finishing is safe — but the NEW
+  # version has to be asked for its version by running it, not by reading
+  # AI4DEV_VERSION, which is still the old value in this process.
+  local now; now="$("$kit/bin/ai4dev" version 2>/dev/null || echo "ai4dev ?")"
+  ok "upgraded: was ai4dev $AI4DEV_VERSION, now $now"
+  info "Your prompts, checklists, decisions and notes were not touched."
 }
 
 cmd_key() {
@@ -405,11 +670,21 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
 
   ai4dev init            clone the course repositories into ~/ai4dev
   ai4dev doctor          verify everything, fetch your key, make one real request
+  ai4dev ask <prompt>    ask an alias directly, and see what the answer cost
   ai4dev review <file>   review a file with your review prompt, from your kit
   ai4dev commit          write a commit message from the staged diff
   ai4dev costs           your spend, your remaining budget, where your traces are
+  ai4dev costs --last N  the last N requests: tokens, cost, latency, which model
   ai4dev key             check that your virtual key is present and usable
   ai4dev config          show the resolved configuration
+  ai4dev upgrade         update the tool from the course, leaving your work alone
+
+ask takes:
+  --model <alias>        frontier · cheap · open-hosted · reviewer · committer …
+  --temp <n>             sent only if you pass it. Some aliases reject it — on
+                         purpose, and the error will explain why
+  --n <count>            run the same prompt this many times, 1 to 20
+  --prompt-file <path>   read the prompt from a file instead of the command line
 
 This script lives in your kit. Edit prompts/code_review.md and the behaviour of
 'ai4dev review' changes in every repository you work in.
@@ -420,9 +695,11 @@ main() {
   case "${1:-help}" in
     init)    shift; cmd_init    "$@" ;;
     doctor)  shift; cmd_doctor  "$@" ;;
+    ask)     shift; cmd_ask     "$@" ;;
     review)  shift; cmd_review  "$@" ;;
     commit)  shift; cmd_commit  "$@" ;;
     costs)   shift; cmd_costs   "$@" ;;
+    upgrade) shift; cmd_upgrade "$@" ;;
     key)     shift; cmd_key     "$@" ;;
     config)  shift; cmd_config  "$@" ;;
     version|--version|-v) printf 'ai4dev %s\n' "$AI4DEV_VERSION" ;;
