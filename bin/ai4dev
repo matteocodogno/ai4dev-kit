@@ -18,6 +18,7 @@
 #   ai4dev costs --last N  the last N requests: tokens, cost, latency, which model
 #   ai4dev key             check that your virtual key is present and usable
 #   ai4dev config          show the resolved configuration
+#   ai4dev upgrade         update the tool from the course, leaving your work alone
 #
 # Config resolution: environment > ~/.config/ai4dev/config > defaults.
 # Your virtual key lives in that config file, which must be mode 600. This
@@ -25,7 +26,12 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.1.0"
+readonly AI4DEV_VERSION="1.2.0"
+
+# The parts of this kit the COURSE owns and may replace. Everything else in
+# here is yours: your prompts once you have edited them, your checklists, your
+# decisions, your notes. 'ai4dev upgrade' updates this list and nothing else.
+readonly COURSE_OWNED=(bin README.md config.example)
 readonly CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ai4dev/config"
 
 # The kit is this script's own repository: bin/ai4dev -> repo root.
@@ -568,6 +574,62 @@ cmd_costs() {
   info "Open one and find four things: input tokens, output tokens, cost, and exactly what was sent."
 }
 
+# upgrade — update the tool, not your work.
+#
+# The kit is one repository holding two different things: a tool the course
+# ships and keeps changing, and work that is yours from Kit Zero onward. A
+# 'git pull' cannot tell them apart, and by Module 2 your branch has diverged
+# from the course's anyway, so a fast-forward is not even available.
+#
+# So this does not pull. It checks out the course-owned paths from origin/main
+# and commits only those. Your prompts, checklists, decisions and notes are
+# never touched, and there is no merge to resolve because the two sets of files
+# do not overlap.
+cmd_upgrade() {
+  load_config
+
+  local kit="$KIT_ROOT"
+  [[ -d "$kit/.git" ]] || die "$kit is not a git repository. Re-clone your kit and copy your work across."
+  git -C "$kit" remote get-url origin >/dev/null 2>&1 || die "this kit has no 'origin' remote, so there is nothing to upgrade from."
+
+  # Your own edits to a course-owned file would be overwritten. Stop instead.
+  if ! git -C "$kit" diff --quiet -- "${COURSE_OWNED[@]}" 2>/dev/null \
+     || ! git -C "$kit" diff --cached --quiet -- "${COURSE_OWNED[@]}" 2>/dev/null; then
+    bad "you have uncommitted changes in ${COURSE_OWNED[*]}"
+    info "commit or stash them first: the upgrade would overwrite them."
+    exit 1
+  fi
+
+  info "fetching from $(git -C "$kit" remote get-url origin)"
+  git -C "$kit" fetch --quiet origin main 2>/dev/null \
+    || die "could not reach the course repository. Check your network, then try again."
+
+  local changed
+  changed="$(git -C "$kit" diff --name-only HEAD origin/main -- "${COURSE_OWNED[@]}" 2>/dev/null || true)"
+
+  if [[ -z "$changed" ]]; then
+    ok "already up to date — ai4dev $AI4DEV_VERSION"
+    return 0
+  fi
+
+  printf '\n%sthis will replace:%s\n' "$B" "$N"
+  printf '  %s\n' $changed
+  printf '\n'
+
+  git -C "$kit" checkout origin/main -- "${COURSE_OWNED[@]}"
+  git -C "$kit" commit --quiet -m "kit: update the ai4dev tool from the course" -- "${COURSE_OWNED[@]}" \
+    || info "nothing to commit — the files were already staged as they are"
+
+  # This script has just overwritten itself while running. Bash has already read
+  # and parsed everything it needs (every command lives inside a function, and
+  # the last line of the file has been read), so finishing is safe — but the NEW
+  # version has to be asked for its version by running it, not by reading
+  # AI4DEV_VERSION, which is still the old value in this process.
+  local now; now="$("$kit/bin/ai4dev" version 2>/dev/null || echo "ai4dev ?")"
+  ok "upgraded: was ai4dev $AI4DEV_VERSION, now $now"
+  info "Your prompts, checklists, decisions and notes were not touched."
+}
+
 cmd_key() {
   load_config
   local key mode
@@ -615,6 +677,7 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
   ai4dev costs --last N  the last N requests: tokens, cost, latency, which model
   ai4dev key             check that your virtual key is present and usable
   ai4dev config          show the resolved configuration
+  ai4dev upgrade         update the tool from the course, leaving your work alone
 
 ask takes:
   --model <alias>        frontier · cheap · open-hosted · reviewer · committer …
@@ -636,6 +699,7 @@ main() {
     review)  shift; cmd_review  "$@" ;;
     commit)  shift; cmd_commit  "$@" ;;
     costs)   shift; cmd_costs   "$@" ;;
+    upgrade) shift; cmd_upgrade "$@" ;;
     key)     shift; cmd_key     "$@" ;;
     config)  shift; cmd_config  "$@" ;;
     version|--version|-v) printf 'ai4dev %s\n' "$AI4DEV_VERSION" ;;

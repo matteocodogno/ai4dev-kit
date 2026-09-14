@@ -65,6 +65,7 @@ Before day 1 it will report **`no virtual key yet`** in yellow and, if everythin
 | `ai4dev costs --last N` | The last N requests: tokens in and out, cost, latency, which model answered |
 | `ai4dev key` | Checks that your virtual key is present and your config file is locked down |
 | `ai4dev config` | Shows the resolved configuration |
+| `ai4dev upgrade` | Updates the tool from the course, and touches nothing else |
 
 Three things worth knowing about how it works:
 
@@ -106,6 +107,22 @@ when (UTC)           alias        model that answered             in     out    
 You now have three records of the same request and they do not say the same thing. The gateway knows what it charged you. The dashboard knows what was sent and what came back. This file knows **how long you waited**, which neither of the other two can see, because latency is a property of where you are standing. Notice which question each one can answer, and which one you reach for.
 
 The file is yours and it is local. Deleting it loses nothing the gateway does not still have.
+
+---
+
+## `upgrade`, and why it is not `git pull`
+
+This kit holds two different things: a tool the course ships and keeps changing, and work that is yours from Kit Zero onward. From Module 2 your branch has commits the course does not have, so a fast-forward pull is not even on the table, and a merge would make you resolve a conflict between the course's tool and your own history.
+
+`ai4dev upgrade` does not pull. It takes the **course-owned paths** — `bin/`, `README.md`, `config.example` — from the course's `main` and commits only those.
+
+```bash
+ai4dev upgrade
+```
+
+Your prompts, checklists, decisions and notes are never touched, so there is nothing to resolve: the two sets of files do not overlap. If you have uncommitted edits to a course-owned file, it stops and tells you instead of overwriting them.
+
+Note what this means for `prompts/`. The course seeds those files once and then they are yours — Module 3 has you rewrite `code_review.md`, and an upgrade must never undo that. That is why `prompts/` is not on the list.
 
 ---
 
