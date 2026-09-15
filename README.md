@@ -31,6 +31,13 @@ exec $SHELL -l
 ai4dev version
 ```
 
+The course's assistant is **OpenCode**. Install it now; you connect it to the gateway on day 1, with one command, once you have a key.
+
+```bash
+brew install anomalyco/tap/opencode     # or: curl -fsSL https://opencode.ai/install | bash
+opencode --version
+```
+
 Then create your configuration from the example and lock it down. The gateway URL is `https://aiproxy.ai4dev.dev/v1`; the dashboard is `https://langfuse.ai4dev.dev`. **Leave the key line empty** — the key is issued in the room on day 1.
 
 ```bash
@@ -59,6 +66,7 @@ Before day 1 it will report **`no virtual key yet`** in yellow and, if everythin
 | `ai4dev init` | Clones the course repositories into `~/ai4dev` |
 | `ai4dev doctor` | Verifies the environment. With a key, makes one real request; without one, says *ready for day 1* |
 | `ai4dev ask <prompt>` | Asks an alias directly and tells you what the answer cost |
+| `ai4dev code` | Starts OpenCode against the course gateway, with your key borrowed for the life of one process |
 | `ai4dev review <file>` | Reviews a file with **your** review prompt |
 | `ai4dev commit` | Writes a commit message from the staged diff |
 | `ai4dev costs` | Your spend, your remaining budget, where your traces are |
@@ -70,6 +78,8 @@ Before day 1 it will report **`no virtual key yet`** in yellow and, if everythin
 Three things worth knowing about how it works:
 
 **It never names a model.** It asks for a *role*: `reviewer`, `committer`, `architect`, `tester`. Which model answers is decided on the gateway, by someone else. You will notice this in Module 1 and it comes back in Module 11.
+
+**It lends your key rather than exporting it.** `ai4dev code` starts OpenCode with `AI4DEV_API_KEY` set for that one process, then gets out of the way. The OpenCode config it writes at `~/.config/opencode/opencode.json` names the gateway and the three aliases and contains the string `{env:AI4DEV_API_KEY}` — not your key. That file is safe to read, copy or screenshot. The usual shortcut, exporting the key from your shell profile, puts it in the environment of every process you start for the rest of the week.
 
 **It never prints your key in full.** `ai4dev config` and `ai4dev key` show the first few characters and the permissions of the file holding it, never the whole thing. `doctor` fails if that file is readable by anyone else on the machine.
 
