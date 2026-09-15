@@ -81,6 +81,8 @@ Three things worth knowing about how it works:
 
 **It lends your key rather than exporting it.** `ai4dev code` starts OpenCode with `AI4DEV_API_KEY` set for that one process, then gets out of the way. The OpenCode config it writes at `~/.config/opencode/opencode.json` names the gateway and the three aliases and contains the string `{env:AI4DEV_API_KEY}` — not your key. That file is safe to read, copy or screenshot. The usual shortcut, exporting the key from your shell profile, puts it in the environment of every process you start for the rest of the week.
 
+**So start OpenCode with `ai4dev code`, never with a bare `opencode`.** A bare `opencode` starts anyway and warns about nothing: the variable is simply not set, so the requests go out with no key on them and the gateway answers 401. That looks exactly like a broken key and is not one — it is the key not being there.
+
 **It never prints your key in full.** `ai4dev config` and `ai4dev key` show the first few characters and the permissions of the file holding it, never the whole thing. `doctor` fails if that file is readable by anyone else on the machine.
 
 **Your key is low-stakes on purpose.** It is capped at a fixed budget, it lives only as long as the course, and one call revokes it. That is why it can arrive by Slack DM instead of through a secret manager: the control is sized to the risk. Ask yourself whether the same reasoning holds for your employer's provider keys. It usually does not, and noticing the difference is the actual skill.
