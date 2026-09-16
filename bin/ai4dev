@@ -28,7 +28,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.4.0"
+readonly AI4DEV_VERSION="1.4.1"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -659,6 +659,15 @@ cmd_costs() {
     printf '\n%s  $%s across the last %s request%s%s\n' "$D" "$sum" "$count" \
       "$([[ "$count" -eq 1 ]] || printf s)" "$N"
     info "The gateway charged you this. The dashboard can show you what you sent for it."
+
+    # This ledger holds only what THIS CLI sent. Your assistant talks to the
+    # gateway directly, so none of its requests are in here — and the newest row
+    # will happily be an hour old while looking exactly like the thing you just
+    # did. A real number attached to the wrong event is worse than no number, so
+    # say the boundary out loud rather than trusting anyone to infer it from a
+    # timestamp they did not read.
+    info "Only requests made by this CLI are recorded here — not your assistant's."
+    info "For everything on your key, including the assistant: ai4dev costs"
     return 0
   fi
 
