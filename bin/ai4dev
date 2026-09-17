@@ -28,7 +28,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.4.1"
+readonly AI4DEV_VERSION="1.5.0"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -296,6 +296,60 @@ render() {
 
 # ─── commands ────────────────────────────────────────────────────────────────
 
+# git@github.com:owner  ->  https://github.com/owner
+#
+# Corporate networks block outbound 22 far more often than they block 443, and
+# it is never the participant's fault and never fixable from the room. So the
+# SSH remote stays the default and HTTPS is the automatic second try: nobody
+# has to know this happened, and nobody has to edit a config file while
+# fifteen people wait.
+https_base() {
+  local b="${1:-}" rest
+  case "$b" in
+    git@*:*)   rest="${b#git@}"; printf 'https://%s/%s' "${rest%%:*}" "${rest#*:}" ;;
+    ssh://git@*) rest="${b#ssh://git@}"; printf 'https://%s' "${rest/://}" ;;
+    *)         printf '%s' "$b" ;;
+  esac
+}
+
+# clone_repo <repo> <dest> — try the configured remote, then HTTPS.
+clone_repo() {
+  local repo="$1" dest="$2" primary fallback err
+  primary="$AI4DEV_GIT_BASE/$repo.git"
+  fallback="$(https_base "$AI4DEV_GIT_BASE")/$repo.git"
+
+  if err="$(git clone --quiet "$primary" "$dest" 2>&1)"; then
+    ok "$repo cloned"
+    return 0
+  fi
+
+  # A blocked port 22 surfaces as half a dozen different messages depending on
+  # the firewall, so do not try to classify the failure. If an HTTPS form of the
+  # same remote exists, just try it. A second clone costs seconds.
+  if [[ "$fallback" != "$primary" ]]; then
+    discard_partial_clone "$dest"
+    warn "$repo: the ssh remote did not work, trying https"
+    if git clone --quiet "$fallback" "$dest" 2>/dev/null; then
+      ok "$repo cloned over https"
+      return 0
+    fi
+  fi
+
+  discard_partial_clone "$dest"
+  bad "could not clone $repo" "show this line to the facilitator"
+  printf '%s\n' "$err" | sed 's/^/    /' >&2
+  return 1
+}
+
+# A failed clone usually cleans up after itself, but not always. Only ever
+# inside the workspace, and only a path we just built ourselves.
+discard_partial_clone() {
+  local dest="${1:-}"
+  [[ -n "$dest" && -n "${AI4DEV_WORKSPACE:-}" && "$dest" == "$AI4DEV_WORKSPACE"/* ]] || return 0
+  [[ -e "$dest" ]] && rm -rf "$dest"
+  return 0
+}
+
 cmd_init() {
   load_config
   info "workspace: $AI4DEV_WORKSPACE"
@@ -308,11 +362,7 @@ cmd_init() {
     if [[ -d "$AI4DEV_WORKSPACE/$repo/.git" ]]; then
       ok "$repo already cloned"
     else
-      if git clone --quiet "$AI4DEV_GIT_BASE/$repo.git" "$AI4DEV_WORKSPACE/$repo" 2>/dev/null; then
-        ok "$repo cloned"
-      else
-        warn "could not clone $repo — check your GitHub access, then ask on Slack"
-      fi
+      clone_repo "$repo" "$AI4DEV_WORKSPACE/$repo" || true
     fi
   done
 
