@@ -20,6 +20,8 @@
 #   ai4dev costs --last N  the last N requests: tokens, cost, latency, which model
 #   ai4dev key             check that your virtual key is present and usable
 #   ai4dev config          show the resolved configuration
+#   ai4dev module N start  put the repository at the start of module N
+#   ai4dev module N end    show how module N was solved
 #   ai4dev upgrade         update the tool from the course, leaving your work alone
 #
 # Config resolution: environment > ~/.config/ai4dev/config > defaults.
@@ -28,7 +30,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.5.0"
+readonly AI4DEV_VERSION="1.6.0"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -895,6 +897,106 @@ cmd_config() {
   info "Only the first characters of your key are ever shown, here or anywhere else."
 }
 
+# ── module ──────────────────────────────────────────────────────────────────
+#
+# The course repository carries one tag per module boundary, all of them on
+# main: module-01-start, module-01-end, module-04-start, module-04-end and so
+# on. This command puts you on one of them.
+#
+# Three rules it never breaks:
+#   - it refuses if you have uncommitted work, and tells you how to keep it
+#   - it puts you on a real local branch, never a detached HEAD, so your work
+#     has somewhere to live and `git status` says something useful
+#   - `end` does NOT touch your working tree by default. The solution is
+#     something to compare against, not something to be overwritten by.
+
+module_repo() {
+  local repo="${AI4DEV_WORKSPACE:-$HOME/ai4dev}/tinder4dogs"
+  [[ -d "$repo/.git" ]] || die "no course repository at $repo — run: ai4dev init"
+  printf '%s' "$repo"
+}
+
+module_number() {
+  # accepts 4, 04, m4, module-04
+  local raw="${1:-}"
+  raw="${raw#module-}"; raw="${raw#m}"
+  case "$raw" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%02d' "$((10#$raw))"
+}
+
+module_fetch() {
+  git fetch --tags --quiet origin 2>/dev/null \
+    || warn "could not reach the remote, using the tags you already have"
+}
+
+module_require_clean() {
+  [[ -z "$(git status --porcelain)" ]] && return 0
+  printf '\n'
+  bad "you have uncommitted changes, so nothing has been moved"
+  info "keep them:     git add -A && git commit -m 'wip'"
+  info "park them:     git stash push -u -m 'before module'"
+  info "discard them:  git reset --hard   (this is not reversible)"
+  exit 1
+}
+
+cmd_module() {
+  local n where repo tag branch
+  n="$(module_number "${1:-}")" || {
+    printf 'usage: ai4dev module <number> [start|end]\n\n'
+    info "examples:  ai4dev module 4 start    ai4dev module 4 end"
+    exit 2
+  }
+  where="${2:-start}"
+  local shown="${n#0}"          # "04" is right for a tag and wrong in a sentence
+  repo="$(module_repo)"
+  cd "$repo" || die "cannot enter $repo"
+
+  case "$where" in
+    start)
+      tag="module-${n}-start"
+      branch="m${n}"
+      module_fetch
+      git rev-parse -q --verify "refs/tags/$tag" >/dev/null \
+        || die "$tag does not exist yet — that module has not been prepared"
+      module_require_clean
+      git switch -C "$branch" "$tag" --quiet \
+        || die "could not switch to $tag"
+      ok "you are at the start of module $shown, on branch $branch"
+      info "the tag itself: $tag"
+      info "commit as often as you like — this branch is yours"
+      info "when you want to see how it was solved: ai4dev module $shown end"
+      ;;
+    end)
+      tag="module-${n}-end"
+      module_fetch
+      git rev-parse -q --verify "refs/tags/$tag" >/dev/null \
+        || die "$tag does not exist yet — the solution is published after the module"
+      if [[ "${3:-}" == "--checkout" || "${1:-}" == "--checkout" ]]; then
+        module_require_clean
+        git switch -C "m${n}-solution" "$tag" --quiet \
+          || die "could not switch to $tag"
+        ok "you are on the reference solution, on branch m${n}-solution"
+        info "your own work is still on m${n} — git switch m${n} to go back"
+      else
+        ok "the reference solution for module $shown is $tag"
+        printf '\n'
+        git --no-pager diff --stat HEAD "$tag" || true
+        printf '\n'
+        info "read it:     git diff HEAD $tag"
+        info "why:         git log -1 $tag"
+        info "check it out next to your work, without losing yours:"
+        info "             ai4dev module $shown end --checkout"
+        warn "your working tree has NOT been touched"
+      fi
+      ;;
+    *)
+      die "ai4dev module $shown <start|end>"
+      ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
@@ -910,6 +1012,11 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
   ai4dev costs --last N  the last N requests: tokens, cost, latency, which model
   ai4dev key             check that your virtual key is present and usable
   ai4dev config          show the resolved configuration
+  ai4dev module N start  put the course repository at the start of module N,
+                         on a branch of your own. Refuses if you have
+                         uncommitted work rather than throwing it away
+  ai4dev module N end    show how module N was solved, WITHOUT touching your
+                         working tree. --checkout puts it side by side
   ai4dev upgrade         update the tool from the course, leaving your work alone
                          (--force to take the course's copy even when yours is newer)
 
@@ -937,6 +1044,7 @@ main() {
     upgrade) shift; cmd_upgrade "$@" ;;
     key)     shift; cmd_key     "$@" ;;
     config)  shift; cmd_config  "$@" ;;
+    module)  shift; cmd_module  "$@" ;;
     version|--version|-v) printf 'ai4dev %s\n' "$AI4DEV_VERSION" ;;
     help|--help|-h) usage ;;
     *) printf 'unknown command: %s\n\n' "$1"; usage; exit 1 ;;
