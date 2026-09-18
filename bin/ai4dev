@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.7.0"
+readonly AI4DEV_VERSION="1.8.0"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -42,7 +42,6 @@ readonly CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ai4dev/config"
 # XDG_CONFIG_HOME, so neither do we here: a path we invent is a path OpenCode
 # will not read.
 readonly OPENCODE_CONFIG_FILE="$HOME/.config/opencode/opencode.json"
-readonly OPENCODE_DEFAULT_MODEL="${AI4DEV_OPENCODE_MODEL:-open-hosted}"
 
 # The kit is this script's own repository: bin/ai4dev -> repo root.
 KIT_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -84,6 +83,7 @@ load_config() {
   AI4DEV_DASHBOARD_URL="${AI4DEV_DASHBOARD_URL:-}"
   AI4DEV_GIT_BASE="${AI4DEV_GIT_BASE:-git@github.com:matteocodogno}"
   AI4DEV_START_TAG="${AI4DEV_START_TAG:-module-01-start}"
+  AI4DEV_OPENCODE_MODEL="${AI4DEV_OPENCODE_MODEL:-open-hosted}"
 }
 
 require_gateway() {
@@ -629,7 +629,11 @@ cmd_ask() {
 gateway_model_ids() {
   # Ask the gateway which aliases this key may actually use, instead of keeping
   # a copy of the list in here. A model added to the gateway shows up in
-  # OpenCode after `ai4dev code --reconfigure`, with no new CLI release.
+  # OpenCode on the next `ai4dev code`, with no new CLI release.
+  #
+  # "this key may use" is literal: /models answers per-key. An alias the
+  # gateway serves but the key is not entitled to will not be in this list,
+  # and that is a key problem, not a CLI one.
   #
   # The `-fallback` aliases are filtered out on purpose: they are what the
   # router reaches for when a primary fails, not something a human picks.
@@ -643,49 +647,74 @@ gateway_model_ids() {
       | select(length > 0)' 2>/dev/null
 }
 
-write_opencode_config() {
-  local key="${1:-}" ids default
-  default="${AI4DEV_OPENCODE_MODEL:-$OPENCODE_DEFAULT_MODEL}"
+sync_opencode_config() {
+  # Rewrites ONLY .provider.ai4dev and .model, and leaves the rest of the file
+  # exactly as it was. That matters more than it sounds: Module 4 has people
+  # editing the `permission` block in this same file, and a tool that helpfully
+  # regenerates the whole thing would delete an exercise.
+  local key="${1:-}" force="${2:-0}"
+  local ids default existing before_list before_model after_list after_model tmp
+
+  existing='{}'
+  if [[ -f "$OPENCODE_CONFIG_FILE" ]]; then
+    if ! existing="$(jq '.' "$OPENCODE_CONFIG_FILE" 2>/dev/null)"; then
+      if [[ "$force" -ne 1 ]]; then
+        bad "$OPENCODE_CONFIG_FILE is not valid JSON" "fix it, or: ai4dev code --reconfigure"
+        exit 1
+      fi
+      cp "$OPENCODE_CONFIG_FILE" "$OPENCODE_CONFIG_FILE.broken.$(date +%s)"
+      warn "kept a copy of the unreadable file next to it"
+      existing='{}'
+    fi
+  fi
 
   if ! ids="$(gateway_model_ids "$key")"; then
+    if [[ -f "$OPENCODE_CONFIG_FILE" ]]; then
+      warn "could not reach the gateway — leaving your OpenCode config as it is"
+      return 0
+    fi
     warn "could not ask the gateway for your model list, writing the course defaults"
     ids='["cheap","frontier","open-hosted"]'
   fi
 
-  # Never write a default the key cannot reach. A config that names a model you
-  # are not allowed to use fails on the first prompt, with an error about
-  # authorisation that reads like the key is broken.
+  default="$AI4DEV_OPENCODE_MODEL"
   if ! printf '%s' "$ids" | jq -e --arg d "$default" 'index($d) != null' >/dev/null 2>&1; then
     warn "$default is not one of your aliases — using $(printf '%s' "$ids" | jq -r '.[0]') instead"
     default="$(printf '%s' "$ids" | jq -r '.[0]')"
   fi
 
+  before_list="$(printf '%s' "$existing" | jq -c '(.provider.ai4dev.models // {}) | keys')"
+  before_model="$(printf '%s' "$existing" | jq -r '.model // ""')"
+
   mkdir -p "$(dirname "$OPENCODE_CONFIG_FILE")"
-  jq -n --arg url "$AI4DEV_GATEWAY_URL" --arg default "$default" --argjson ids "$ids" '{
-    "$schema": "https://opencode.ai/config.json",
-    provider: {
-      ai4dev: {
+  tmp="$OPENCODE_CONFIG_FILE.tmp.$$"
+  printf '%s' "$existing" | jq \
+    --arg url "$AI4DEV_GATEWAY_URL" --arg default "$default" --argjson ids "$ids" '
+      .["$schema"] = (.["$schema"] // "https://opencode.ai/config.json")
+    | .provider.ai4dev = {
         npm: "@ai-sdk/openai-compatible",
         name: "AI4Dev gateway",
-        options: {
-          baseURL: $url,
-          apiKey: "{env:AI4DEV_API_KEY}"
-        },
+        options: { baseURL: $url, apiKey: "{env:AI4DEV_API_KEY}" },
         models: (
           $ids
-          | map({
-              key: .,
-              value: { name: (if . == $default then . + " (default)" else . end) }
-            })
+          | map({ key: ., value: { name: (if . == $default then . + " (default)" else . end) } })
           | from_entries
         )
       }
-    },
-    model: ("ai4dev/" + $default)
-  }' > "$OPENCODE_CONFIG_FILE"
+    | .model = ("ai4dev/" + $default)
+  ' > "$tmp" || { rm -f "$tmp"; die "could not write $tmp"; }
+  mv "$tmp" "$OPENCODE_CONFIG_FILE"
 
-  OPENCODE_MODEL_COUNT="$(printf '%s' "$ids" | jq -r 'length')"
-  OPENCODE_CHOSEN_MODEL="$default"
+  after_list="$(jq -c '.provider.ai4dev.models | keys' "$OPENCODE_CONFIG_FILE")"
+  after_model="$(jq -r '.model' "$OPENCODE_CONFIG_FILE")"
+
+  if [[ "$before_list" != "$after_list" || "$before_model" != "$after_model" || "$force" -eq 1 ]]; then
+    ok "OpenCode config updated: $(printf '%s' "$ids" | jq -r 'length') models, default $default"
+    [[ "$before_model" != "$after_model" && -n "$before_model" ]] \
+      && info "default was $before_model"
+    info "switch model in OpenCode with /models · keep another default:"
+    info "  echo 'AI4DEV_OPENCODE_MODEL=\"frontier\"' >> $CONFIG_FILE"
+  fi
 }
 
 cmd_code() {
@@ -709,18 +738,10 @@ cmd_code() {
   key="$(fetch_key)" \
     || die "no virtual key yet. Paste the one from your Slack DM into $CONFIG_FILE, then try again."
 
-  if [[ ! -f "$OPENCODE_CONFIG_FILE" || "$reconfigure" -eq 1 ]]; then
-    write_opencode_config "$key"
-    ok "wrote $OPENCODE_CONFIG_FILE"
-    info "$OPENCODE_MODEL_COUNT models from the gateway, default $OPENCODE_CHOSEN_MODEL. Your key is not in it."
-    info "Switch model inside OpenCode with /models. To pick a different default:"
-    info "  AI4DEV_OPENCODE_MODEL=frontier ai4dev code --reconfigure"
-  elif ! jq -e '.provider.ai4dev' "$OPENCODE_CONFIG_FILE" >/dev/null 2>&1; then
-    printf '%serror:%s %s\n' "$R" "$N" "$OPENCODE_CONFIG_FILE exists but declares no 'ai4dev' provider." >&2
-    info "  If that file is yours, copy it somewhere safe first."
-    info "  Then:  ai4dev code --reconfigure"
-    exit 1
-  fi
+  # Every run, not just the first. The model list lives on the gateway and
+  # changes there; a config written in Module 1 should not still be describing
+  # Module 1 in Module 8. Quiet when nothing changed.
+  sync_opencode_config "$key" "$reconfigure"
 
   # The key enters the environment of this process, which is about to be
   # replaced by OpenCode. No shell survives this line holding it.
@@ -1046,8 +1067,10 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
   ai4dev init            clone the course repositories into ~/ai4dev
   ai4dev doctor          verify everything, fetch your key, make one real request
   ai4dev ask <prompt>    ask an alias directly, and see what the answer cost
-  ai4dev code            start OpenCode against the course gateway
-                         (--reconfigure to rewrite its config)
+  ai4dev code            start OpenCode against the course gateway. Refreshes
+                         the model list from the gateway on every run and
+                         leaves the rest of your OpenCode config alone
+                         (--reconfigure to recover an unreadable one)
   ai4dev review <file>   review a file with your review prompt, from your kit
   ai4dev commit          write a commit message from the staged diff
   ai4dev costs           your spend, your remaining budget, where your traces are

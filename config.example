@@ -24,3 +24,9 @@ AI4DEV_GIT_BASE="git@github.com:matteocodogno"
 
 # The tag the product repository starts from. Changes every module.
 AI4DEV_START_TAG="module-01-start"
+
+# Which gateway alias OpenCode starts on. Leave it out and you get the course
+# default. Anything you set here survives `ai4dev code`, which refreshes the
+# model list on every run but never argues with this line.
+#
+# AI4DEV_OPENCODE_MODEL="frontier"
