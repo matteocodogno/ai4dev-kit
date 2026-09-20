@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.8.1"
+readonly AI4DEV_VERSION="1.9.0"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -1016,8 +1016,12 @@ module_require_clean() {
 cmd_module() {
   local n where repo tag branch
   n="$(module_number "${1:-}")" || {
-    printf 'usage: ai4dev module <number> [start|end]\n\n'
-    info "examples:  ai4dev module 4 start    ai4dev module 4 end"
+    printf 'usage: ai4dev module <number> start\n'
+    printf '       ai4dev module <number> end [--mine|--checkout]\n\n'
+    info "start              put me at the beginning of the module, on my own branch"
+    info "end                show me how it was solved, as a diff"
+    info "end --mine         show me how far my work is from it"
+    info "end --checkout     put the solution on a branch beside mine, so I can run it"
     exit 2
   }
   where="${2:-start}"
@@ -1041,27 +1045,73 @@ cmd_module() {
       info "when you want to see how it was solved: ai4dev module $shown end"
       ;;
     end)
+      # Three questions, and they are not the same question:
+      #
+      #   how was it solved?        the author's change, start..end. The default,
+      #                             because it is what somebody typing `end` wants.
+      #   how far am I from it?     --mine. Noisier by nature: it contains every
+      #                             change you made, inverted.
+      #   let me run it.            --checkout, a branch beside your own.
+      #
+      # It used to print only `diff --stat`, which answers none of the three: a
+      # list of filenames is a signpost, not an answer, and it cost a second
+      # command to get to the thing everybody was actually asking for.
       tag="module-${n}-end"
+      base="module-${n}-start"
       module_fetch
       git rev-parse -q --verify "refs/tags/$tag" >/dev/null \
         || die "$tag does not exist yet — the solution is published after the module"
-      if [[ "${3:-}" == "--checkout" || "${1:-}" == "--checkout" ]]; then
-        module_require_clean
-        git switch -C "m${n}-solution" "$tag" --quiet \
-          || die "could not switch to $tag"
-        ok "you are on the reference solution, on branch m${n}-solution"
-        info "your own work is still on m${n} — git switch m${n} to go back"
-      else
-        ok "the reference solution for module $shown is $tag"
-        printf '\n'
-        git --no-pager diff --stat HEAD "$tag" || true
-        printf '\n'
-        info "read it:     git diff HEAD $tag"
-        info "why:         git log -1 $tag"
-        info "check it out next to your work, without losing yours:"
-        info "             ai4dev module $shown end --checkout"
-        warn "your working tree has NOT been touched"
-      fi
+
+      local mode="how"
+      case "${3:-${1:-}}" in
+        --checkout) mode="checkout" ;;
+        --mine)     mode="mine" ;;
+      esac
+
+      case "$mode" in
+        checkout)
+          module_require_clean
+          git switch -C "m${n}-solution" "$tag" --quiet \
+            || die "could not switch to $tag"
+          ok "you are on the reference solution, on branch m${n}-solution"
+          info "your own work is still on m${n} — git switch m${n} to go back"
+          ;;
+        mine)
+          ok "how your work differs from the reference solution for module $shown"
+          printf '\n'
+          if git diff --quiet HEAD "$tag"; then
+            info "nothing — your tree is identical to $tag"
+            printf '\n'
+          else
+            git --no-pager diff --stat HEAD "$tag" || true
+            printf '\n'
+            git diff HEAD "$tag" || true
+            printf '\n'
+          fi
+          info "how it was solved, on its own:  ai4dev module $shown end"
+          warn "your working tree has NOT been touched"
+          ;;
+        *)
+          # If the start tag is missing, the change is still the commit itself.
+          git rev-parse -q --verify "refs/tags/$base" >/dev/null || base="${tag}^"
+          ok "how module $shown was solved — $base..$tag"
+          printf '\n'
+          # Subject only, deliberately. The body of these commits is written for
+          # whoever prepares the module and can carry answer-key material; it is
+          # one command away for anyone who wants it, and that is the right
+          # distance.
+          git --no-pager log -1 --format='%s' "$tag"
+          printf '\n'
+          git --no-pager diff --stat "$base" "$tag" || true
+          printf '\n'
+          git diff "$base" "$tag" || true
+          printf '\n'
+          info "why it was done this way:          git log -1 $tag"
+          info "how far your own work is from it:  ai4dev module $shown end --mine"
+          info "check it out and run it:           ai4dev module $shown end --checkout"
+          warn "your working tree has NOT been touched"
+          ;;
+      esac
       ;;
     *)
       die "ai4dev module $shown <start|end>"
