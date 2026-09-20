@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.8.0"
+readonly AI4DEV_VERSION="1.8.1"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -741,7 +741,16 @@ cmd_code() {
   # Every run, not just the first. The model list lives on the gateway and
   # changes there; a config written in Module 1 should not still be describing
   # Module 1 in Module 8. Quiet when nothing changed.
-  sync_opencode_config "$key" "$reconfigure"
+  #
+  # Redirected to stderr, and that redirect is load-bearing. `ai4dev code run`
+  # passes straight through to `opencode run`, which people pipe:
+  #
+  #     ai4dev code run --format json "..." > run.jsonl
+  #
+  # A friendly "OpenCode config updated" line on stdout lands in the middle of
+  # that file and breaks whatever reads it. Progress goes to stderr; only the
+  # wrapped tool's output belongs on stdout.
+  sync_opencode_config "$key" "$reconfigure" >&2
 
   # The key enters the environment of this process, which is about to be
   # replaced by OpenCode. No shell survives this line holding it.
