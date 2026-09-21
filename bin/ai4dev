@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.9.0"
+readonly AI4DEV_VERSION="1.9.1"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -160,6 +160,42 @@ readonly LEDGER="${XDG_STATE_HOME:-$HOME/.local/state}/ai4dev/usage.jsonl"
 # and therefore does survive. That is what last_call_footer does.
 LAST_ALIAS=""; LAST_MODEL=""; LAST_IN=0; LAST_OUT=0; LAST_COST=0; LAST_LATENCY=0
 
+# ─── when the gateway is not the one answering ───────────────────────────────
+#
+# The gateway returns JSON even for its own errors. So a body that is not JSON
+# means something else answered: in practice a VPN or a corporate proxy that
+# intercepted the request and replied with its own HTML page. Left alone, that
+# reaches the participant as "jq: parse error: Invalid numeric literal at line
+# 1, column 10", which is jq choking on the first ten characters of <!DOCTYPE.
+# Nobody can act on that. Say what actually happened instead.
+
+url_host() { local h="${1#*://}"; printf '%s' "${h%%/*}"; }
+
+# not_json_reason <body_file> [content_type]
+# Succeeds and prints a description when the body is NOT JSON; fails when it is.
+not_json_reason() {
+  local body="$1" ctype="${2:-}"
+  jq empty "$body" >/dev/null 2>&1 && [[ -s "$body" ]] && return 1
+  if [[ "$ctype" == *html* ]] || head -c 300 "$body" | grep -qiE '<!doctype|<html'; then
+    printf 'an HTML page, not JSON'
+  elif [[ ! -s "$body" ]]; then
+    printf 'an empty response'
+  else
+    printf 'something that is not JSON ("%s")' "$(head -c 60 "$body" | tr -d '\r\n')"
+  fi
+}
+
+# gateway_not_json_die <url> <http_code> <reason>
+gateway_not_json_die() {
+  printf '%serror:%s %s answered with %s (HTTP %s).\n\n' "$R" "$N" "$1" "$3" "${2:-?}" >&2
+  printf '  The gateway answers in JSON even when it refuses you, so this is almost\n' >&2
+  printf '  certainly not the gateway. Usually a VPN or a corporate proxy intercepted\n' >&2
+  printf '  the request and replied with its own page.\n\n' >&2
+  printf '  Disconnect the VPN and try again, or ask for %s to be allow-listed.\n' "$(url_host "$1")" >&2
+  printf '  If you are on no VPN, check AI4DEV_GATEWAY_URL in %s.\n' "$CONFIG_FILE" >&2
+  exit 1
+}
+
 header_value() {
   # header_value <file> <header-name>
   # Case-insensitive, tolerates the CR, prints nothing when the header is absent.
@@ -234,14 +270,18 @@ call() {
   trap 'rm -f "$body_file" "$hdr_file"' RETURN
 
   local meta_out http_code
-  meta_out="$(curl -sS -o "$body_file" -D "$hdr_file" -w '%{http_code} %{time_total}' \
+  meta_out="$(curl -sS -o "$body_file" -D "$hdr_file" -w '%{http_code} %{time_total} %{content_type}' \
     -X POST "$AI4DEV_GATEWAY_URL/chat/completions" \
     -H "Authorization: Bearer $key" \
     -H "Content-Type: application/json" \
     -d "$payload")" || die "could not reach the gateway. Run 'ai4dev doctor'."
 
-  http_code="${meta_out%% *}"
-  LAST_LATENCY="${meta_out##* }"
+  local ctype reason
+  read -r http_code LAST_LATENCY ctype <<< "$meta_out"
+
+  if reason="$(not_json_reason "$body_file" "$ctype")"; then
+    gateway_not_json_die "$AI4DEV_GATEWAY_URL/chat/completions" "$http_code" "$reason"
+  fi
 
   local response; response="$(cat "$body_file")"
 
@@ -490,8 +530,19 @@ cmd_doctor() {
     exit 1
   fi
 
+  local probe_body probe_meta pcode pctype preason
+  probe_body="$(mktemp)"
+  probe_meta="$(curl -sS --max-time 15 -o "$probe_body" -w '%{http_code} %{content_type}' \
+                 "${AI4DEV_GATEWAY_URL:-http://invalid}/models" 2>/dev/null || true)"
+  read -r pcode pctype <<< "${probe_meta:-000}"
+
   if [[ -z "$AI4DEV_GATEWAY_URL" ]]; then
     bad "AI4DEV_GATEWAY_URL is not set" "see $CONFIG_FILE"
+  elif [[ -z "$pcode" || "$pcode" == "000" ]]; then
+    bad "could not reach $(url_host "$AI4DEV_GATEWAY_URL")" "check your network and VPN, then AI4DEV_GATEWAY_URL in $CONFIG_FILE"
+  elif preason="$(not_json_reason "$probe_body" "$pctype")"; then
+    bad "$(url_host "$AI4DEV_GATEWAY_URL") answered with $preason (HTTP $pcode)" \
+        "almost always a VPN or corporate proxy intercepting the request: disconnect it, or ask for $(url_host "$AI4DEV_GATEWAY_URL") to be allow-listed"
   else
     local reply
     reply="$(call reviewer "Reply with exactly: ready" "task=doctor" 2>/dev/null || true)"
@@ -502,6 +553,7 @@ cmd_doctor() {
       bad "the gateway did not answer" "check AI4DEV_GATEWAY_URL, then ask on Slack"
     fi
   fi
+  rm -f "$probe_body"
 
   printf '\n'
   if [[ "$FAILED" -eq 0 ]]; then
@@ -802,8 +854,17 @@ cmd_costs() {
   local key; key="$(fetch_key)" || die "could not fetch your virtual key"
 
   local base="${AI4DEV_GATEWAY_URL%/v1}"
-  local info_json
-  info_json="$(curl -sS "$base/key/info" -H "Authorization: Bearer $key" 2>/dev/null || echo '{}')"
+  local info_json body_file meta code ctype reason
+  body_file="$(mktemp)"
+  meta="$(curl -sS --max-time 15 -o "$body_file" -w '%{http_code} %{content_type}' \
+            "$base/key/info" -H "Authorization: Bearer $key" 2>/dev/null)" \
+    || { rm -f "$body_file"; die "could not reach $(url_host "$base") — check your network and VPN"; }
+  read -r code ctype <<< "$meta"
+  if reason="$(not_json_reason "$body_file" "$ctype")"; then
+    rm -f "$body_file"
+    gateway_not_json_die "$base/key/info" "$code" "$reason"
+  fi
+  info_json="$(cat "$body_file")"; rm -f "$body_file"
 
   local spend budget
   spend="$( printf '%s' "$info_json" | jq -r '.info.spend      // .spend      // 0')"
