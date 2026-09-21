@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.9.1"
+readonly AI4DEV_VERSION="1.9.2"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -804,10 +804,38 @@ cmd_code() {
   # wrapped tool's output belongs on stdout.
   sync_opencode_config "$key" "$reconfigure" >&2
 
+  # Everywhere else in the course a model is a bare alias: `ai4dev ask
+  # --model cheap`. OpenCode wants provider/model and splits on the first "/",
+  # so `--model cheap` becomes provider "cheap" with an empty model, and the
+  # user gets "UnknownError: Unexpected server error" with nothing to act on.
+  # Qualify bare aliases with our provider; leave anything with a "/" alone,
+  # and stop at a bare "--" so literal arguments are never touched.
+  local args=() a qualified=""
+  while [[ $# -gt 0 ]]; do
+    a="$1"; shift
+    case "$a" in
+      --) args+=("$a" "$@"); break ;;
+      -m|--model)
+        if [[ $# -gt 0 && "$1" != */* && "$1" != -* ]]; then
+          args+=("$a" "ai4dev/$1"); qualified="$1"; shift
+        else
+          args+=("$a")
+        fi ;;
+      --model=*|-m=*)
+        if [[ "${a#*=}" != */* ]]; then
+          args+=("${a%%=*}=ai4dev/${a#*=}"); qualified="${a#*=}"
+        else
+          args+=("$a")
+        fi ;;
+      *) args+=("$a") ;;
+    esac
+  done
+  [[ -n "$qualified" ]] && info "model: ai4dev/$qualified" >&2
+
   # The key enters the environment of this process, which is about to be
   # replaced by OpenCode. No shell survives this line holding it.
   export AI4DEV_API_KEY="$key"
-  exec opencode "$@"
+  exec opencode ${args[@]+"${args[@]}"}
 }
 
 cmd_costs() {
