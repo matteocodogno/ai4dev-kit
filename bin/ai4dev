@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.11.1"
+readonly AI4DEV_VERSION="1.12.0"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -1382,17 +1382,24 @@ cmd_sdd() {
   warn "this changed files in the repository — review and commit them deliberately"
 }
 
-# ─── mcp — connect a server, without a secret if we can help it ──────────────
+# ─── mcp — connect a server, with the smallest secret that works ────────────
 #
-# The honest default is no token at all. GitHub's remote MCP server speaks the
-# MCP OAuth flow, and OpenCode implements it: `opencode mcp auth github` opens
-# a browser, the participant approves, and the credential lives in OpenCode's
-# own store rather than in a config file, a chat message or a printed card.
+# The zero-secret path does not exist for GitHub, and it is worth knowing why.
+# OpenCode's `opencode mcp auth` registers itself with the authorization server
+# on the spot (RFC 7591, dynamic client registration). GitHub's remote MCP
+# server does not implement it — "Incompatible auth server: does not support
+# dynamic client registration" is that, and nothing you can fix in the config.
+# OpenCode does accept a pre-registered `oauth.clientId` / `clientSecret`, but
+# a GitHub OAuth app needs its secret to exchange the code, so that would mean
+# handing the same secret to a room. Worse than a token per person.
 #
-# --token is the fallback for a machine that cannot complete a browser flow.
-# Even then the token never goes into opencode.json: it is stored in this
+# So the default is a token, and the first place we look is `gh auth token`:
+# most participants are already logged in, which means no new credential is
+# created at all. The token never goes into opencode.json — it lives in this
 # CLI's config, mode 600, and `ai4dev code` puts it in the environment of the
 # process it is about to become, exactly as it does the gateway key.
+#
+# --oauth is still there for a server that does support registration.
 readonly GITHUB_MCP_URL="https://api.githubcopilot.com/mcp/"
 
 github_token_from_somewhere() {
@@ -1443,38 +1450,41 @@ cmd_mcp() {
       ;;
     add)
       local what="${1:-}"; shift || true
-      [[ "$what" == "github" ]] || die "usage: ai4dev mcp add github [--token]"
-      local mode="oauth"
-      [[ "${1:-}" == "--token" ]] && mode="token"
+      [[ "$what" == "github" ]] || die "usage: ai4dev mcp add github [--oauth]"
+      local mode="token"
+      [[ "${1:-}" == "--oauth" ]] && mode="oauth"
+      [[ "${1:-}" == "--token" ]] && mode="token"   # accepted, it is the default
 
       if [[ "$mode" == "oauth" ]]; then
         mcp_write_block github "$(jq -n --arg url "$GITHUB_MCP_URL" \
           '{type:"remote", url:$url, enabled:true}')"
-        ok "github added to $OPENCODE_CONFIG_FILE — remote server, no token stored"
+        ok "github added to $OPENCODE_CONFIG_FILE — no token stored"
         printf '\n'
-        info "one more step, once, and it opens a browser:"
-        info "  opencode mcp auth github"
-        info "OpenCode keeps that credential in its own store. Nothing lands in a"
-        info "config file, and nobody has to be handed a secret."
+        info "now run:  opencode mcp auth github"
         printf '\n'
-        warn "from your next OpenCode session this server's tool definitions are in"
-        warn "the context of every request. Measure it before you decide to keep it."
+        warn "against GitHub this fails with \"does not support dynamic client"
+        warn "registration\". GitHub does not implement it, and no setting here"
+        warn "changes that. Use: ai4dev mcp add github"
         return 0
       fi
 
-      local token
+      local token from_gh=0
       if token="$(github_token_from_somewhere)"; then
-        ok "found a GitHub token in your environment or in gh"
+        from_gh=1
+        ok "using the token you are already signed in with"
       else
         warn "no token found in GITHUB_TOKEN, GH_TOKEN or 'gh auth token'"
-        info "create one at https://github.com/settings/tokens with read-only scope,"
-        info "then paste it here. It is not echoed and it is not committed anywhere."
+        info "the cheapest fix is to sign in once:  gh auth login"
+        info "otherwise create a fine-grained token at"
+        info "https://github.com/settings/personal-access-tokens — read-only, this"
+        info "repository, a short expiry — and paste it here. It is not echoed."
         printf '  token: ' >&2
         read -rs token; printf '\n' >&2
         [[ -n "$token" ]] || die "nothing pasted"
       fi
 
       umask 077
+      mkdir -p "$(dirname "$CONFIG_FILE")"
       touch "$CONFIG_FILE"
       # Replace any previous line rather than appending a second one.
       if grep -q '^AI4DEV_GITHUB_TOKEN=' "$CONFIG_FILE" 2>/dev/null; then
@@ -1491,9 +1501,18 @@ cmd_mcp() {
       ok "github added, and your token is in $CONFIG_FILE (mode 600), not in the OpenCode config"
       info "ai4dev code puts it in the environment of the session it starts, and"
       info "nowhere else. A bare 'opencode' will not find it, which is the point."
+      if [[ "$from_gh" -eq 1 ]]; then
+        printf '\n'
+        warn "that token carries every scope you gave gh. For a course repository"
+        warn "that is fine; for client work, make a fine-grained one instead."
+      fi
+      printf '\n'
+      info "check it answers:  opencode mcp list"
       printf '\n'
       warn "from your next OpenCode session this server's tool definitions are in"
       warn "the context of every request. Measure it before you decide to keep it."
+      info "the agent can already run 'gh' in the terminal, for free. That is the"
+      info "comparison worth making before you keep this."
       ;;
     *)
       die "usage: ai4dev mcp add github [--token] · ai4dev mcp list · ai4dev mcp remove <name>"
@@ -1527,9 +1546,9 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
                          course repository, keeping your own AGENTS.md
   ai4dev sdd commands    optional: make the /kiro-* phases show up in OpenCode's
                          slash menu. They already run without this
-  ai4dev mcp add github  connect GitHub's MCP server. No token by default:
-                         it uses OAuth, and 'opencode mcp auth github' does
-                         the browser step. --token for machines that cannot
+  ai4dev mcp add github  connect GitHub's MCP server, with the token you are
+                         already signed in with where there is one. GitHub has
+                         no browser flow that works here: see the notes in mcp
   ai4dev mcp list        what is connected, and whether it authenticated
   ai4dev mcp remove <n>  disconnect one, and stop paying for its definitions
   ai4dev upgrade         update the tool from the course, leaving your work alone
