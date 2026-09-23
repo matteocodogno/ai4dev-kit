@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.12.0"
+readonly AI4DEV_VERSION="1.12.1"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -1436,6 +1436,13 @@ cmd_mcp() {
   case "$sub" in
     list)
       command -v opencode >/dev/null 2>&1 || die "opencode not found"
+      # The config says Bearer {env:AI4DEV_GITHUB_TOKEN}. OpenCode substitutes
+      # that from ITS OWN environment, and an unset variable becomes the empty
+      # string: the server then sees a bare "Bearer" and answers 400, which
+      # OpenCode reports as "SSE error: Non-200 status code (400)" — an auth
+      # failure wearing a transport failure's clothes. So a bare
+      # `opencode mcp list` cannot work. This one can, because it exports it.
+      [[ -n "${AI4DEV_GITHUB_TOKEN:-}" ]] && export AI4DEV_GITHUB_TOKEN
       exec opencode mcp list
       ;;
     remove)
@@ -1507,7 +1514,10 @@ cmd_mcp() {
         warn "that is fine; for client work, make a fine-grained one instead."
       fi
       printf '\n'
-      info "check it answers:  opencode mcp list"
+      info "check it answers:  ai4dev mcp list"
+      warn "not 'opencode mcp list' on its own: the token is not in that shell's"
+      warn "environment, GitHub sees an empty Bearer and answers 400. OpenCode"
+      warn "shows that as \"SSE error: Non-200 status code (400)\"."
       printf '\n'
       warn "from your next OpenCode session this server's tool definitions are in"
       warn "the context of every request. Measure it before you decide to keep it."
