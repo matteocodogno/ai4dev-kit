@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.13.0"
+readonly AI4DEV_VERSION="1.14.0"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -502,6 +502,59 @@ cmd_doctor() {
     else warn "product is at '$tag', expected $AI4DEV_START_TAG"; fi
   else
     warn "product not cloned — expected before the session. Run 'ai4dev init' when told to."
+  fi
+
+  # github
+  #
+  # Two different things, and the failure looks the same from the outside:
+  # gh has to be there for the GitHub MCP server to get a token at all, and
+  # the account behind gh has to be able to see — and, on the day we open
+  # issues and pull requests, to push to — the course repository. Someone who
+  # was never invited is not broken: they fork, and point the kit at the fork.
+  local gh_is_load_bearing=0
+  [[ "${AI4DEV_GITHUB_TOKEN_SOURCE:-}" == "gh" ]] && gh_is_load_bearing=1
+  if [[ -f "$OPENCODE_CONFIG_FILE" ]] \
+     && jq -e '.mcp.github' "$OPENCODE_CONFIG_FILE" >/dev/null 2>&1; then
+    gh_is_load_bearing=1
+  fi
+
+  local slug; slug="$(github_repo_slug tinder4dogs 2>/dev/null || true)"
+  if ! command -v gh >/dev/null 2>&1; then
+    if [[ "$gh_is_load_bearing" -eq 1 ]]; then
+      bad "gh not found, and the GitHub MCP server takes its token from gh" \
+          "brew install gh && gh auth login"
+    else
+      warn "gh not found — you need it on the day we connect GitHub, not before"
+      info "  brew install gh && gh auth login"
+    fi
+  elif ! gh auth status >/dev/null 2>&1; then
+    if [[ "$gh_is_load_bearing" -eq 1 ]]; then
+      bad "gh is installed but not logged in, so the GitHub MCP server has no token" "gh auth login"
+    else
+      warn "gh is installed but not logged in"
+      info "  gh auth login"
+    fi
+  else
+    local who; who="$(gh api user --jq .login 2>/dev/null || true)"
+    ok "gh logged in${who:+ as $who}"
+    if [[ -n "$slug" ]]; then
+      local perm; perm="$(gh api "repos/$slug" --jq '.permissions.push' 2>/dev/null || true)"
+      case "$perm" in
+        true)  ok "$slug: you can push" ;;
+        false)
+          warn "$slug: you can read it, but not push"
+          info "  fine until we open pull requests. Then either ask for a collaborator"
+          info "  invite, or work on your own fork:"
+          info "    gh repo fork $slug --clone=false"
+          info "    then set AI4DEV_GIT_BASE=\"git@github.com:${who:-<you>}\" in $CONFIG_FILE"
+          ;;
+        *)
+          warn "$slug: your GitHub account cannot see it"
+          info "  you have not been invited as a collaborator yet. Ask for the invite,"
+          info "  accept it, and run this again. Nothing else here depends on it today."
+          ;;
+      esac
+    fi
   fi
 
   # the two that matter
@@ -1411,6 +1464,14 @@ github_token_from_somewhere() {
     printf '%s' "$t"; return 0
   fi
   return 1
+}
+
+# github.com:matteocodogno  or  https://github.com/matteocodogno  ->  matteocodogno/<repo>
+github_repo_slug() {
+  local base="${AI4DEV_GIT_BASE:-}" owner
+  owner="${base%/}"; owner="${owner##*[:/]}"
+  [[ -n "$owner" ]] || return 1
+  printf '%s/%s' "$owner" "$1"
 }
 
 # Asked for at the moment it is needed, never kept.
