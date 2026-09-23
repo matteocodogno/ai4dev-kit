@@ -6,6 +6,7 @@
 # follows you into every repository you work in. No AI command is ever defined
 # inside a product repository.
 #
+#   ai4dev fork            fork the product to your own account; you push there
 #   ai4dev init            clone the course repositories into ~/ai4dev
 #   ai4dev doctor          verify everything; with a key, make one real request
 #                          (before day 1 there is no key yet — that is expected,
@@ -30,12 +31,17 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.14.0"
+readonly AI4DEV_VERSION="1.15.0"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
 # decisions, your notes. 'ai4dev upgrade' updates this list and nothing else.
 readonly COURSE_OWNED=(bin README.md config.example)
+
+# Where the course's own repositories live. AI4DEV_GIT_BASE is where YOUR copy
+# lives, and after `ai4dev fork` the two are different: you push to yours, and
+# the module tags keep arriving from this one.
+readonly AI4DEV_COURSE_BASE="${AI4DEV_COURSE_BASE:-git@github.com:matteocodogno}"
 readonly CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ai4dev/config"
 
 # OpenCode reads its global config from this exact path. It does not honour
@@ -355,28 +361,50 @@ https_base() {
   esac
 }
 
+# The module tags are cut in the course repository. A fork copies the tags it
+# had the day it was made and nothing after, so a clone that is not the course
+# repository needs somewhere to fetch them from: that is what `upstream` is for.
+ensure_upstream() {
+  local dir="$1" repo="$2" url="$AI4DEV_COURSE_BASE/$repo.git" origin=""
+  [[ -d "$dir/.git" ]] || return 0
+  origin="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+  # same place: nothing to add
+  [[ "$origin" == "$url" || "$origin" == "$(https_base "$AI4DEV_COURSE_BASE")/$repo.git" ]] && return 0
+  if git -C "$dir" remote get-url upstream >/dev/null 2>&1; then
+    git -C "$dir" remote set-url upstream "$url"
+  else
+    git -C "$dir" remote add upstream "$url" 2>/dev/null || return 0
+  fi
+  git -C "$dir" fetch --tags --quiet upstream 2>/dev/null || true
+  return 0
+}
+
 # clone_repo <repo> <dest> — try the configured remote, then HTTPS.
 clone_repo() {
-  local repo="$1" dest="$2" primary fallback err
-  primary="$AI4DEV_GIT_BASE/$repo.git"
-  fallback="$(https_base "$AI4DEV_GIT_BASE")/$repo.git"
-
-  if err="$(git clone --quiet "$primary" "$dest" 2>&1)"; then
-    ok "$repo cloned"
-    return 0
+  local repo="$1" dest="$2" err="" cand tried=0
+  # Your own base first — after `ai4dev fork` that is your fork. Then the
+  # course's, because you fork the product and not every repository the course
+  # hands you. Each one over ssh, then over https: a blocked port 22 surfaces
+  # as half a dozen different messages depending on the firewall, so do not try
+  # to classify the failure, just try the other form. A second clone costs
+  # seconds.
+  local candidates=()
+  candidates+=("$AI4DEV_GIT_BASE/$repo.git")
+  candidates+=("$(https_base "$AI4DEV_GIT_BASE")/$repo.git")
+  if [[ "$AI4DEV_GIT_BASE" != "$AI4DEV_COURSE_BASE" ]]; then
+    candidates+=("$AI4DEV_COURSE_BASE/$repo.git")
+    candidates+=("$(https_base "$AI4DEV_COURSE_BASE")/$repo.git")
   fi
 
-  # A blocked port 22 surfaces as half a dozen different messages depending on
-  # the firewall, so do not try to classify the failure. If an HTTPS form of the
-  # same remote exists, just try it. A second clone costs seconds.
-  if [[ "$fallback" != "$primary" ]]; then
-    discard_partial_clone "$dest"
-    warn "$repo: the ssh remote did not work, trying https"
-    if git clone --quiet "$fallback" "$dest" 2>/dev/null; then
-      ok "$repo cloned over https"
+  for cand in "${candidates[@]}"; do
+    [[ "$tried" -eq 0 ]] || discard_partial_clone "$dest"
+    tried=$((tried + 1))
+    if err="$(git clone --quiet "$cand" "$dest" 2>&1)"; then
+      [[ "$tried" -eq 1 ]] && ok "$repo cloned" || ok "$repo cloned from $cand"
+      ensure_upstream "$dest" "$repo"
       return 0
     fi
-  fi
+  done
 
   discard_partial_clone "$dest"
   bad "could not clone $repo" "show this line to the facilitator"
@@ -430,6 +458,77 @@ cmd_init() {
   info "$AI4DEV_KIT/                 yours. It grows every module, and it goes home with you."
   printf '\n'
   ok "ready. Now run: ai4dev doctor"
+}
+
+# ─── fork — your own copy of the product, which is where you push ───────────
+#
+# The course repository is read-only for the room: 25 people with push on one
+# main branch is an incident waiting for a quiet moment. You work on a fork,
+# which is also how the pull request exercise stops being a simulation.
+#
+# Tags are the one thing a fork does not keep up with: it copies what existed
+# the day it was made. So the clone keeps 'upstream' pointing at the course
+# repository, and `ai4dev module N start` fetches tags from there.
+cmd_fork() {
+  load_config
+  command -v gh >/dev/null 2>&1 || die "gh not found.  brew install gh && gh auth login"
+  gh auth status >/dev/null 2>&1 || die "gh is installed but not logged in.  gh auth login"
+
+  local who; who="$(gh api user --jq .login 2>/dev/null || true)"
+  [[ -n "$who" ]] || die "GitHub did not say who you are. Try: gh auth status"
+
+  local repo="${1:-tinder4dogs}"
+  local owner="${AI4DEV_COURSE_BASE%/}"; owner="${owner##*[:/]}"
+  local src="$owner/$repo"
+
+  [[ "$who" != "$owner" ]] || die "you are $owner — you own $src, there is nothing to fork"
+
+  gh api "repos/$src" --jq .name >/dev/null 2>&1 \
+    || die "your GitHub account cannot see $src. Ask for read access, accept the invite, then run this again."
+
+  if gh api "repos/$who/$repo" --jq .name >/dev/null 2>&1; then
+    ok "$who/$repo already exists"
+  else
+    info "forking $src…"
+    gh repo fork "$src" --clone=false >/dev/null 2>&1 \
+      || die "the fork did not happen. Run it by hand:  gh repo fork $src --clone=false"
+    ok "forked to $who/$repo"
+  fi
+
+  # remember it, so `ai4dev init` clones yours
+  umask 077
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  touch "$CONFIG_FILE"
+  if grep -q '^AI4DEV_GIT_BASE=' "$CONFIG_FILE" 2>/dev/null; then
+    local tmpc="$CONFIG_FILE.tmp.$$"
+    grep -v '^AI4DEV_GIT_BASE=' "$CONFIG_FILE" > "$tmpc" || true
+    mv "$tmpc" "$CONFIG_FILE"
+  fi
+  printf 'AI4DEV_GIT_BASE="git@github.com:%s"\n' "$who" >> "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+  AI4DEV_GIT_BASE="git@github.com:$who"
+  ok "AI4DEV_GIT_BASE now points at you"
+
+  # and rewire a clone you already have, in the protocol it already uses
+  local dir="$AI4DEV_WORKSPACE/$repo"
+  if [[ -d "$dir/.git" ]]; then
+    local current fork_url
+    current="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+    if [[ "$current" == https://* ]]; then
+      fork_url="https://github.com/$who/$repo.git"
+    else
+      fork_url="git@github.com:$who/$repo.git"
+    fi
+    git -C "$dir" remote set-url origin "$fork_url"
+    ensure_upstream "$dir" "$repo"
+    ok "$dir: origin is your fork, upstream is $src"
+  else
+    info "nothing cloned yet — 'ai4dev init' will clone your fork"
+  fi
+
+  printf '\n'
+  info "from here: you push to your fork, and the module tags keep coming from"
+  info "$src through 'upstream'. 'ai4dev module N start' fetches them for you."
 }
 
 cmd_doctor() {
@@ -518,13 +617,17 @@ cmd_doctor() {
     gh_is_load_bearing=1
   fi
 
-  local slug; slug="$(github_repo_slug tinder4dogs 2>/dev/null || true)"
+  local mine_slug course_owner course_slug
+  mine_slug="$(github_repo_slug tinder4dogs 2>/dev/null || true)"
+  course_owner="${AI4DEV_COURSE_BASE%/}"; course_owner="${course_owner##*[:/]}"
+  course_slug="$course_owner/tinder4dogs"
+
   if ! command -v gh >/dev/null 2>&1; then
     if [[ "$gh_is_load_bearing" -eq 1 ]]; then
       bad "gh not found, and the GitHub MCP server takes its token from gh" \
           "brew install gh && gh auth login"
     else
-      warn "gh not found — you need it on the day we connect GitHub, not before"
+      warn "gh not found — you need it to fork the product, and on the day we connect GitHub"
       info "  brew install gh && gh auth login"
     fi
   elif ! gh auth status >/dev/null 2>&1; then
@@ -537,23 +640,30 @@ cmd_doctor() {
   else
     local who; who="$(gh api user --jq .login 2>/dev/null || true)"
     ok "gh logged in${who:+ as $who}"
-    if [[ -n "$slug" ]]; then
-      local perm; perm="$(gh api "repos/$slug" --jq '.permissions.push' 2>/dev/null || true)"
-      case "$perm" in
-        true)  ok "$slug: you can push" ;;
-        false)
-          warn "$slug: you can read it, but not push"
-          info "  fine until we open pull requests. Then either ask for a collaborator"
-          info "  invite, or work on your own fork:"
-          info "    gh repo fork $slug --clone=false"
-          info "    then set AI4DEV_GIT_BASE=\"git@github.com:${who:-<you>}\" in $CONFIG_FILE"
-          ;;
-        *)
-          warn "$slug: your GitHub account cannot see it"
-          info "  you have not been invited as a collaborator yet. Ask for the invite,"
-          info "  accept it, and run this again. Nothing else here depends on it today."
-          ;;
-      esac
+
+    if ! gh api "repos/$course_slug" --jq .name >/dev/null 2>&1; then
+      warn "$course_slug: your GitHub account cannot see the course repository"
+      info "  you have not accepted the read invite yet. Accept it, then: ai4dev fork"
+    elif [[ "$mine_slug" == "$course_slug" ]]; then
+      warn "you are still pointed at $course_slug — the course runs on your own fork"
+      info "  make it once:  ai4dev fork"
+    else
+      local perm; perm="$(gh api "repos/$mine_slug" --jq '.permissions.push' 2>/dev/null || true)"
+      if [[ "$perm" == "true" ]]; then
+        ok "$mine_slug: your fork, and you can push to it"
+        local dir="$AI4DEV_WORKSPACE/tinder4dogs"
+        if [[ -d "$dir/.git" ]]; then
+          if git -C "$dir" remote get-url upstream >/dev/null 2>&1; then
+            ok "clone: origin is your fork, upstream is the course repository"
+          else
+            warn "your clone has no 'upstream' remote, so new module tags will not arrive"
+            info "  ai4dev fork     (it rewires the clone you already have)"
+          fi
+        fi
+      else
+        warn "$mine_slug: it is not there, or you cannot push to it"
+        info "  ai4dev fork"
+      fi
     fi
   fi
 
@@ -1145,8 +1255,12 @@ module_number() {
 }
 
 module_fetch() {
-  git fetch --tags --quiet origin 2>/dev/null \
-    || warn "could not reach the remote, using the tags you already have"
+  # Tags come from the course repository. On a fork that is 'upstream'; on a
+  # direct clone origin is the course repository and there is no upstream.
+  local remote="origin"
+  git remote get-url upstream >/dev/null 2>&1 && remote="upstream"
+  git fetch --tags --quiet "$remote" 2>/dev/null \
+    || warn "could not reach $remote, using the tags you already have"
 }
 
 module_require_clean() {
@@ -1160,6 +1274,7 @@ module_require_clean() {
 }
 
 cmd_module() {
+  load_config          # AI4DEV_WORKSPACE lives in the config, not in the air
   local n where repo tag branch
   n="$(module_number "${1:-}")" || {
     printf 'usage: ai4dev module <number> start\n'
@@ -1639,6 +1754,9 @@ usage() {
   cat <<EOF
 ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
 
+  ai4dev fork            fork the product to your own GitHub account and point
+                         the kit at it. You push to yours; the module tags keep
+                         coming from the course repository through 'upstream'
   ai4dev init            clone the course repositories into ~/ai4dev
   ai4dev doctor          verify everything, fetch your key, make one real request
   ai4dev ask <prompt>    ask an alias directly, and see what the answer cost
@@ -1683,6 +1801,7 @@ EOF
 
 main() {
   case "${1:-help}" in
+    fork)    shift; cmd_fork    "$@" ;;
     init)    shift; cmd_init    "$@" ;;
     doctor)  shift; cmd_doctor  "$@" ;;
     ask)     shift; cmd_ask     "$@" ;;
