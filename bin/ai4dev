@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.12.1"
+readonly AI4DEV_VERSION="1.13.0"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -835,9 +835,10 @@ cmd_code() {
   # The key enters the environment of this process, which is about to be
   # replaced by OpenCode. No shell survives this line holding it.
   export AI4DEV_API_KEY="$key"
-  # Same treatment for a GitHub token, when `ai4dev mcp add github --token`
-  # stored one. The OpenCode config refers to it by name, never by value.
-  [[ -n "${AI4DEV_GITHUB_TOKEN:-}" ]] && export AI4DEV_GITHUB_TOKEN
+  # Same treatment for a GitHub token, when `ai4dev mcp add github` set one up.
+  # The OpenCode config refers to it by name, never by value.
+  local gh_token; gh_token="$(github_token_resolve)"
+  [[ -n "$gh_token" ]] && export AI4DEV_GITHUB_TOKEN="$gh_token"
   exec opencode ${args[@]+"${args[@]}"}
 }
 
@@ -1412,6 +1413,34 @@ github_token_from_somewhere() {
   return 1
 }
 
+# Asked for at the moment it is needed, never kept.
+#
+# When the token came from gh we store the SOURCE, not the value: gh owns that
+# credential and can replace it whenever it likes — `gh auth logout` alone
+# invalidates it — and a copy of it in our config would simply go quietly stale
+# and fail as a 400 later. Asking gh each time also means the secret never
+# reaches a file of ours at all.
+#
+# A pasted token has no source to ask, so that one is stored.
+github_token_resolve() {
+  # prints the token, or nothing; never dies — a missing token is not fatal
+  local t=""
+  if [[ "${AI4DEV_GITHUB_TOKEN_SOURCE:-}" == "gh" ]]; then
+    if ! command -v gh >/dev/null 2>&1; then
+      warn "the GitHub MCP server wants the token from gh, and gh is not installed" >&2
+      warn "  brew install gh && gh auth login        (or: ai4dev mcp add github)" >&2
+      return 0
+    fi
+    if ! t="$(gh auth token 2>/dev/null)" || [[ -z "$t" ]]; then
+      warn "gh is installed but not logged in, so the GitHub MCP server has no token" >&2
+      warn "  gh auth login" >&2
+      return 0
+    fi
+    printf '%s' "$t"; return 0
+  fi
+  printf '%s' "${AI4DEV_GITHUB_TOKEN:-}"
+}
+
 mcp_write_block() {
   # mcp_write_block <name> <json for that server>
   local name="$1" block="$2" tmp existing
@@ -1442,7 +1471,8 @@ cmd_mcp() {
       # OpenCode reports as "SSE error: Non-200 status code (400)" — an auth
       # failure wearing a transport failure's clothes. So a bare
       # `opencode mcp list` cannot work. This one can, because it exports it.
-      [[ -n "${AI4DEV_GITHUB_TOKEN:-}" ]] && export AI4DEV_GITHUB_TOKEN
+      local gh_token; gh_token="$(github_token_resolve)"
+      [[ -n "$gh_token" ]] && export AI4DEV_GITHUB_TOKEN="$gh_token"
       exec opencode mcp list
       ;;
     remove)
@@ -1476,9 +1506,13 @@ cmd_mcp() {
       fi
 
       local token from_gh=0
-      if token="$(github_token_from_somewhere)"; then
+      if [[ -z "${GITHUB_TOKEN:-}${GH_TOKEN:-}" ]] \
+         && command -v gh >/dev/null 2>&1 \
+         && token="$(gh auth token 2>/dev/null)" && [[ -n "$token" ]]; then
         from_gh=1
-        ok "using the token you are already signed in with"
+        ok "using the login you already have in gh — the token stays with gh"
+      elif token="$(github_token_from_somewhere)"; then
+        ok "using the token in your environment"
       else
         warn "no token found in GITHUB_TOKEN, GH_TOKEN or 'gh auth token'"
         info "the cheapest fix is to sign in once:  gh auth login"
@@ -1493,26 +1527,36 @@ cmd_mcp() {
       umask 077
       mkdir -p "$(dirname "$CONFIG_FILE")"
       touch "$CONFIG_FILE"
-      # Replace any previous line rather than appending a second one.
-      if grep -q '^AI4DEV_GITHUB_TOKEN=' "$CONFIG_FILE" 2>/dev/null; then
+      # Replace any previous lines rather than appending a second one.
+      if grep -qE '^AI4DEV_GITHUB_TOKEN(_SOURCE)?=' "$CONFIG_FILE" 2>/dev/null; then
         local tmpc="$CONFIG_FILE.tmp.$$"
-        grep -v '^AI4DEV_GITHUB_TOKEN=' "$CONFIG_FILE" > "$tmpc" && mv "$tmpc" "$CONFIG_FILE"
+        # grep exits 1 when nothing is left, which is a legitimate outcome here
+        grep -vE '^AI4DEV_GITHUB_TOKEN(_SOURCE)?=' "$CONFIG_FILE" > "$tmpc" || true
+        mv "$tmpc" "$CONFIG_FILE"
       fi
-      printf 'AI4DEV_GITHUB_TOKEN=%s\n' "\"$token\"" >> "$CONFIG_FILE"
+      if [[ "$from_gh" -eq 1 ]]; then
+        printf 'AI4DEV_GITHUB_TOKEN_SOURCE="gh"\n' >> "$CONFIG_FILE"
+      else
+        printf 'AI4DEV_GITHUB_TOKEN=%s\n' "\"$token\"" >> "$CONFIG_FILE"
+      fi
       chmod 600 "$CONFIG_FILE"
 
       mcp_write_block github "$(jq -n --arg url "$GITHUB_MCP_URL" \
         '{type:"remote", url:$url, enabled:true,
           headers:{Authorization:"Bearer {env:AI4DEV_GITHUB_TOKEN}"}}')"
 
-      ok "github added, and your token is in $CONFIG_FILE (mode 600), not in the OpenCode config"
+      if [[ "$from_gh" -eq 1 ]]; then
+        ok "github added. No token was stored: $CONFIG_FILE (mode 600) only"
+        ok "records that gh is where to ask, and it is asked at every start."
+        info "so 'gh auth logout' or a new login just works, with nothing to redo here"
+        printf '\n'
+        warn "that login carries every scope you gave gh. For a course repository"
+        warn "that is fine; for client work, make a fine-grained token instead."
+      else
+        ok "github added, and your token is in $CONFIG_FILE (mode 600), not in the OpenCode config"
+      fi
       info "ai4dev code puts it in the environment of the session it starts, and"
       info "nowhere else. A bare 'opencode' will not find it, which is the point."
-      if [[ "$from_gh" -eq 1 ]]; then
-        printf '\n'
-        warn "that token carries every scope you gave gh. For a course repository"
-        warn "that is fine; for client work, make a fine-grained one instead."
-      fi
       printf '\n'
       info "check it answers:  ai4dev mcp list"
       warn "not 'opencode mcp list' on its own: the token is not in that shell's"
