@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.11.0"
+readonly AI4DEV_VERSION="1.11.1"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -1229,17 +1229,18 @@ readonly CC_SDD_VERSION="${AI4DEV_CC_SDD_VERSION:-3.1.0}"
 readonly SDD_MARK_BEGIN="<!-- ai4dev:cc-sdd:begin -->"
 readonly SDD_MARK_END="<!-- ai4dev:cc-sdd:end -->"
 
-# OpenCode does not turn a skill into a slash command. Skills are loaded by the
-# model through the native `skill` tool, and the `/` palette only lists real
-# commands — measured on 1.18.31: a skill in .opencode/skills/ shows up in the
-# /skills dialog and in the server's command list, and still answers "No
-# matching items" when you type its name after a slash.
+# Typing `/kiro-spec-init <text>` in OpenCode works, even though the `/` popup
+# answers "No matching items" while you type it: the popup lists commands only,
+# but on submit OpenCode resolves the name against the skills too, inlines that
+# SKILL.md into the message and substitutes $ARGUMENTS. Measured on 1.18.31.
 #
-# cc-sdd's own completion message tells you to run `/kiro-spec-init`, which is
-# true for its (deprecated) command layout and not for the skills layout we
-# install. So we write the missing commands ourselves: one thin wrapper per
-# skill, which loads that skill and hands it the arguments. The skill file
-# stays the single source of the instructions.
+# So the commands below are optional, and off by default. They buy one thing:
+# the palette suggests the 17 phases and shows what each one does, instead of
+# telling a room of people that the command they were just told to run does not
+# exist. Each one inlines the same SKILL.md, so the instructions do not move.
+#
+# The cost: the wrapper runs a shell command (`sed` over the skill file) when
+# you submit it. Under a config with bash set to "ask" that is one more prompt.
 sdd_skill_field() {
   # sdd_skill_field <SKILL.md> <field>
   awk -v f="$2" '
@@ -1254,6 +1255,8 @@ sdd_skill_field() {
 sdd_write_wrappers() {
   # prints how many it wrote
   local out=".opencode/command" n=0 skill name desc
+  # inlines the skill body (frontmatter stripped) when the command is submitted
+  local strip='!`sed -e "1,/^---$/d" .opencode/skills/NAME/SKILL.md`'
   [[ -d .opencode/skills ]] || { printf '0'; return 0; }
   mkdir -p "$out"
   for skill in .opencode/skills/kiro-*/SKILL.md; do
@@ -1266,15 +1269,13 @@ sdd_write_wrappers() {
     {
       printf -- '---\n'
       printf 'description: "%s"\n' "$desc"
-      printf -- '---\n\n'
-      printf 'Load the `%s` skill with the skill tool and follow its instructions exactly.\n\n' "$name"
-      printf 'The skill asks for the request, a feature name, or arguments. Use what is\n'
-      printf 'between the tags below, and nothing else, wherever it asks:\n\n'
+      printf -- '---\n'
+      # inline the skill itself, minus its frontmatter
+      printf '%s\n\n' "${strip/NAME/$name}"
+      printf 'The input for this run, which the instructions above ask for:\n\n'
       printf '<input>\n'
       printf '%s\n' '$ARGUMENTS'
-      printf '</input>\n\n'
-      printf 'If that input is empty and the skill needs one, ask for it before doing\n'
-      printf 'anything else. Do not move on to the next phase on your own.\n'
+      printf '</input>\n'
     } > "$out/$name.md"
     n=$((n + 1))
   done
@@ -1296,15 +1297,15 @@ cmd_sdd() {
       info "restart OpenCode and type / to see them"
       return 0
       ;;
-    *) die "usage: ai4dev sdd setup [--lang <code>] [--force] [--no-commands] · ai4dev sdd commands" ;;
+    *) die "usage: ai4dev sdd setup [--lang <code>] [--force] [--commands] · ai4dev sdd commands" ;;
   esac
 
-  local lang="en" force=0 want_commands=1
+  local lang="en" force=0 want_commands=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --lang)        lang="${2:-en}"; shift 2 ;;
       --force)       force=1; shift ;;
-      --no-commands) want_commands=0; shift ;;
+      --commands)    want_commands=1; shift ;;
       *) die "unknown option: $1" ;;
     esac
   done
@@ -1366,18 +1367,18 @@ cmd_sdd() {
   ok "cc-sdd $CC_SDD_VERSION installed"
   info "  .opencode/skills/   the kiro-* workflows, as skills"
   info "  .kiro/settings/     the templates those workflows write from"
-  if [[ "$ncmd" -gt 0 ]]; then
-    info "  .opencode/command/  $ncmd slash commands, one per skill"
-    printf '\n'
-    info "OpenCode does not offer a skill as /name — only the model can reach a"
-    info "skill, through its skill tool. The commands above are what makes"
-    info "/kiro-spec-init exist. The instructions still live in the skill."
-  fi
+  [[ "$ncmd" -gt 0 ]] && info "  .opencode/command/  $ncmd slash commands, one per skill"
   printf '\n'
   info "one phase at a time, and each one is a gate:"
   info "  /kiro-spec-init \"<what to build>\"      then  /kiro-spec-requirements <feature>"
   info "  /kiro-spec-design <feature>            /kiro-spec-tasks <feature>"
   info "run them inside OpenCode, started with: ai4dev code"
+  printf '\n'
+  if [[ "$ncmd" -eq 0 ]]; then
+    warn "while you type one of those, OpenCode will say \"No matching items\"."
+    warn "Ignore it and press enter: the popup lists commands, the skills are"
+    warn "resolved on submit. 'ai4dev sdd commands' adds the popup entries too."
+  fi
   warn "this changed files in the repository — review and commit them deliberately"
 }
 
@@ -1523,10 +1524,9 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
   ai4dev module N end    show how module N was solved, WITHOUT touching your
                          working tree. --checkout puts it side by side
   ai4dev sdd setup       install the spec-driven harness (cc-sdd) into the
-                         course repository, keeping your own AGENTS.md, and
-                         write the /kiro-* commands OpenCode needs to offer it
-  ai4dev sdd commands    rewrite those /kiro-* commands from the skills already
-                         installed, without touching anything else
+                         course repository, keeping your own AGENTS.md
+  ai4dev sdd commands    optional: make the /kiro-* phases show up in OpenCode's
+                         slash menu. They already run without this
   ai4dev mcp add github  connect GitHub's MCP server. No token by default:
                          it uses OAuth, and 'opencode mcp auth github' does
                          the browser step. --token for machines that cannot
