@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.9.2"
+readonly AI4DEV_VERSION="1.10.0"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -835,6 +835,9 @@ cmd_code() {
   # The key enters the environment of this process, which is about to be
   # replaced by OpenCode. No shell survives this line holding it.
   export AI4DEV_API_KEY="$key"
+  # Same treatment for a GitHub token, when `ai4dev mcp add github --token`
+  # stored one. The OpenCode config refers to it by name, never by value.
+  [[ -n "${AI4DEV_GITHUB_TOKEN:-}" ]] && export AI4DEV_GITHUB_TOKEN
   exec opencode ${args[@]+"${args[@]}"}
 }
 
@@ -1208,6 +1211,214 @@ cmd_module() {
   esac
 }
 
+# ─── sdd — the spec-driven harness, installed into the product repo ──────────
+#
+# cc-sdd writes slash-commands, skills and templates into the repository you
+# run it in. Two things about that are worth knowing before it runs:
+#
+#   1. It writes AGENTS.md, and with --yes it overwrites the one that is
+#      already there. In this course that file is the artefact the room wrote
+#      by hand in Module 3, so losing it costs a module. We keep it, and append
+#      cc-sdd's own guidance below it between markers.
+#   2. `--overwrite skip` is not the answer: it skips the whole plan, new files
+#      included, and installs nothing. Measured on 3.1.0.
+#
+# The version is pinned. A course that installs "latest" is a course that
+# behaves differently in the afternoon than it did in rehearsal.
+readonly CC_SDD_VERSION="${AI4DEV_CC_SDD_VERSION:-3.1.0}"
+readonly SDD_MARK_BEGIN="<!-- ai4dev:cc-sdd:begin -->"
+readonly SDD_MARK_END="<!-- ai4dev:cc-sdd:end -->"
+
+cmd_sdd() {
+  local sub="${1:-}"; shift || true
+  [[ "$sub" == "setup" ]] || die "usage: ai4dev sdd setup [--lang <code>] [--force]"
+
+  local lang="en" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --lang)  lang="${2:-en}"; shift 2 ;;
+      --force) force=1; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  command -v npx >/dev/null 2>&1 || die "npx not found — install Node, then run this again."
+  git rev-parse --show-toplevel >/dev/null 2>&1 \
+    || die "run this inside the course repository (cd ~/ai4dev/tinder4dogs)"
+  local root; root="$(git rev-parse --show-toplevel)"
+  cd "$root" || die "cannot enter $root"
+
+  if [[ -d .opencode/skills/kiro-spec-init && "$force" -ne 1 ]]; then
+    ok "cc-sdd is already installed here"
+    info "re-install with: ai4dev sdd setup --force"
+    return 0
+  fi
+
+  # Keep the room's own AGENTS.md. This is the whole reason this command
+  # exists rather than a line in the module page telling people to run npx.
+  local had_agents=0 agents_backup=""
+  if [[ -f AGENTS.md ]]; then
+    had_agents=1
+    agents_backup="$(mktemp)"
+    cp AGENTS.md "$agents_backup"
+  fi
+
+  info "installing cc-sdd $CC_SDD_VERSION for OpenCode…"
+  if ! npx -y "cc-sdd@$CC_SDD_VERSION" --opencode-skills --lang "$lang" --yes >/dev/null 2>&1; then
+    [[ "$had_agents" -eq 1 ]] && cp "$agents_backup" AGENTS.md
+    rm -f "$agents_backup"
+    die "cc-sdd failed. Run it by hand to see why:  npx -y cc-sdd@$CC_SDD_VERSION --opencode-skills --lang $lang --yes"
+  fi
+
+  if [[ "$had_agents" -eq 1 ]]; then
+    local generated; generated="$(mktemp)"
+    cp AGENTS.md "$generated"
+    cp "$agents_backup" AGENTS.md
+    if ! grep -qF "$SDD_MARK_BEGIN" AGENTS.md; then
+      {
+        printf '\n%s\n' "$SDD_MARK_BEGIN"
+        printf '<!-- Added by `ai4dev sdd setup`. Everything above this line is yours. -->\n\n'
+        cat "$generated"
+        printf '\n%s\n' "$SDD_MARK_END"
+      } >> AGENTS.md
+      ok "your AGENTS.md was kept, and cc-sdd's guidance appended below it"
+    else
+      ok "your AGENTS.md was kept (cc-sdd's block was already there)"
+    fi
+    rm -f "$generated"
+  fi
+  rm -f "$agents_backup"
+
+  ok "cc-sdd $CC_SDD_VERSION installed"
+  info "  .opencode/skills/   the kiro-* workflows OpenCode will offer"
+  info "  .kiro/settings/     the templates those workflows write from"
+  printf '\n'
+  info "one phase at a time, and each one is a gate:"
+  info "  /kiro-spec-init \"<what to build>\"      then  /kiro-spec-requirements <feature>"
+  info "  /kiro-spec-design <feature>            /kiro-spec-tasks <feature>"
+  info "run them inside OpenCode, started with: ai4dev code"
+  warn "this changed files in the repository — review and commit them deliberately"
+}
+
+# ─── mcp — connect a server, without a secret if we can help it ──────────────
+#
+# The honest default is no token at all. GitHub's remote MCP server speaks the
+# MCP OAuth flow, and OpenCode implements it: `opencode mcp auth github` opens
+# a browser, the participant approves, and the credential lives in OpenCode's
+# own store rather than in a config file, a chat message or a printed card.
+#
+# --token is the fallback for a machine that cannot complete a browser flow.
+# Even then the token never goes into opencode.json: it is stored in this
+# CLI's config, mode 600, and `ai4dev code` puts it in the environment of the
+# process it is about to become, exactly as it does the gateway key.
+readonly GITHUB_MCP_URL="https://api.githubcopilot.com/mcp/"
+
+github_token_from_somewhere() {
+  local t=""
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then printf '%s' "$GITHUB_TOKEN"; return 0; fi
+  if [[ -n "${GH_TOKEN:-}" ]];     then printf '%s' "$GH_TOKEN";     return 0; fi
+  if command -v gh >/dev/null 2>&1 && t="$(gh auth token 2>/dev/null)" && [[ -n "$t" ]]; then
+    printf '%s' "$t"; return 0
+  fi
+  return 1
+}
+
+mcp_write_block() {
+  # mcp_write_block <name> <json for that server>
+  local name="$1" block="$2" tmp existing
+  mkdir -p "$(dirname "$OPENCODE_CONFIG_FILE")"
+  existing='{}'
+  if [[ -f "$OPENCODE_CONFIG_FILE" ]]; then
+    existing="$(jq '.' "$OPENCODE_CONFIG_FILE" 2>/dev/null)" \
+      || die "$OPENCODE_CONFIG_FILE is not valid JSON — fix it, or: ai4dev code --reconfigure"
+  fi
+  tmp="$OPENCODE_CONFIG_FILE.tmp.$$"
+  printf '%s' "$existing" \
+    | jq --arg n "$name" --argjson b "$block" '.mcp[$n] = $b' > "$tmp" \
+    || { rm -f "$tmp"; die "could not write $tmp"; }
+  mv "$tmp" "$OPENCODE_CONFIG_FILE"
+}
+
+cmd_mcp() {
+  load_config
+  command -v jq >/dev/null 2>&1 || die "jq not found. brew install jq"
+  local sub="${1:-}"; shift || true
+
+  case "$sub" in
+    list)
+      command -v opencode >/dev/null 2>&1 || die "opencode not found"
+      exec opencode mcp list
+      ;;
+    remove)
+      local name="${1:-}"; [[ -n "$name" ]] || die "usage: ai4dev mcp remove <name>"
+      [[ -f "$OPENCODE_CONFIG_FILE" ]] || die "no OpenCode config yet"
+      local tmp="$OPENCODE_CONFIG_FILE.tmp.$$"
+      jq --arg n "$name" 'del(.mcp[$n]) | if (.mcp | length) == 0 then del(.mcp) else . end' \
+        "$OPENCODE_CONFIG_FILE" > "$tmp" || { rm -f "$tmp"; die "could not rewrite the config"; }
+      mv "$tmp" "$OPENCODE_CONFIG_FILE"
+      ok "$name removed from your OpenCode config"
+      info "it stops costing you context on your next session, not this one"
+      ;;
+    add)
+      local what="${1:-}"; shift || true
+      [[ "$what" == "github" ]] || die "usage: ai4dev mcp add github [--token]"
+      local mode="oauth"
+      [[ "${1:-}" == "--token" ]] && mode="token"
+
+      if [[ "$mode" == "oauth" ]]; then
+        mcp_write_block github "$(jq -n --arg url "$GITHUB_MCP_URL" \
+          '{type:"remote", url:$url, enabled:true}')"
+        ok "github added to $OPENCODE_CONFIG_FILE — remote server, no token stored"
+        printf '\n'
+        info "one more step, once, and it opens a browser:"
+        info "  opencode mcp auth github"
+        info "OpenCode keeps that credential in its own store. Nothing lands in a"
+        info "config file, and nobody has to be handed a secret."
+        printf '\n'
+        warn "from your next OpenCode session this server's tool definitions are in"
+        warn "the context of every request. Measure it before you decide to keep it."
+        return 0
+      fi
+
+      local token
+      if token="$(github_token_from_somewhere)"; then
+        ok "found a GitHub token in your environment or in gh"
+      else
+        warn "no token found in GITHUB_TOKEN, GH_TOKEN or 'gh auth token'"
+        info "create one at https://github.com/settings/tokens with read-only scope,"
+        info "then paste it here. It is not echoed and it is not committed anywhere."
+        printf '  token: ' >&2
+        read -rs token; printf '\n' >&2
+        [[ -n "$token" ]] || die "nothing pasted"
+      fi
+
+      umask 077
+      touch "$CONFIG_FILE"
+      # Replace any previous line rather than appending a second one.
+      if grep -q '^AI4DEV_GITHUB_TOKEN=' "$CONFIG_FILE" 2>/dev/null; then
+        local tmpc="$CONFIG_FILE.tmp.$$"
+        grep -v '^AI4DEV_GITHUB_TOKEN=' "$CONFIG_FILE" > "$tmpc" && mv "$tmpc" "$CONFIG_FILE"
+      fi
+      printf 'AI4DEV_GITHUB_TOKEN=%s\n' "\"$token\"" >> "$CONFIG_FILE"
+      chmod 600 "$CONFIG_FILE"
+
+      mcp_write_block github "$(jq -n --arg url "$GITHUB_MCP_URL" \
+        '{type:"remote", url:$url, enabled:true,
+          headers:{Authorization:"Bearer {env:AI4DEV_GITHUB_TOKEN}"}}')"
+
+      ok "github added, and your token is in $CONFIG_FILE (mode 600), not in the OpenCode config"
+      info "ai4dev code puts it in the environment of the session it starts, and"
+      info "nowhere else. A bare 'opencode' will not find it, which is the point."
+      printf '\n'
+      warn "from your next OpenCode session this server's tool definitions are in"
+      warn "the context of every request. Measure it before you decide to keep it."
+      ;;
+    *)
+      die "usage: ai4dev mcp add github [--token] · ai4dev mcp list · ai4dev mcp remove <name>"
+      ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
@@ -1230,6 +1441,13 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
                          uncommitted work rather than throwing it away
   ai4dev module N end    show how module N was solved, WITHOUT touching your
                          working tree. --checkout puts it side by side
+  ai4dev sdd setup       install the spec-driven harness (cc-sdd) into the
+                         course repository, keeping your own AGENTS.md
+  ai4dev mcp add github  connect GitHub's MCP server. No token by default:
+                         it uses OAuth, and 'opencode mcp auth github' does
+                         the browser step. --token for machines that cannot
+  ai4dev mcp list        what is connected, and whether it authenticated
+  ai4dev mcp remove <n>  disconnect one, and stop paying for its definitions
   ai4dev upgrade         update the tool from the course, leaving your work alone
                          (--force to take the course's copy even when yours is newer)
 
@@ -1258,6 +1476,8 @@ main() {
     key)     shift; cmd_key     "$@" ;;
     config)  shift; cmd_config  "$@" ;;
     module)  shift; cmd_module  "$@" ;;
+    sdd)     shift; cmd_sdd     "$@" ;;
+    mcp)     shift; cmd_mcp     "$@" ;;
     version|--version|-v) printf 'ai4dev %s\n' "$AI4DEV_VERSION" ;;
     help|--help|-h) usage ;;
     *) printf 'unknown command: %s\n\n' "$1"; usage; exit 1 ;;
