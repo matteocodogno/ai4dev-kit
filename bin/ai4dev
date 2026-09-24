@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.15.1"
+readonly AI4DEV_VERSION="1.16.0"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -550,6 +550,18 @@ cmd_doctor() {
   else bad "git identity not configured" "git config --global user.name '...' && git config --global user.email '...'"; fi
 
   if command -v jq >/dev/null 2>&1; then ok "jq present"; else bad "jq not found" "brew install jq"; fi
+
+  # npx: only 'ai4dev sdd setup' needs it, and that is day 4 — so this is yellow
+  # until the day it is load-bearing. The fix is one line and it is mise's job,
+  # not homebrew's: nothing here wants a node installed globally.
+  if command -v npx >/dev/null 2>&1; then
+    ok "npx $(npx --version 2>/dev/null | head -1)"
+  elif command -v mise >/dev/null 2>&1; then
+    warn "npx not found — needed by 'ai4dev sdd setup' on day 4, not before"
+    info "  mise use -g node@22        (ai4dev sdd setup will also ask mise itself)"
+  else
+    bad "npx not found and no mise to get it from" "brew install node"
+  fi
 
   if command -v betterleaks >/dev/null 2>&1; then ok "betterleaks present"
   else bad "betterleaks not found" "brew install betterleaks"; fi
@@ -1410,6 +1422,28 @@ readonly SDD_MARK_END="<!-- ai4dev:cc-sdd:end -->"
 #
 # The cost: the wrapper runs a shell command (`sed` over the skill file) when
 # you submit it. Under a config with bash set to "ask" that is one more prompt.
+# cc-sdd is an npm package, so this needs npx. Plenty of laptops in a Kotlin
+# room have never had Node on them, and the failure lands in the middle of a
+# 15-minute setup slot with everybody watching.
+#
+# mise is on every machine here, and it can hand us a node without installing
+# one globally or touching anything the participant owns. We never take that on
+# faith: the probe below IS the proof, and if it does not answer we say what to
+# run rather than guessing.
+sdd_npx() {
+  # prints a command prefix able to run npx, or fails
+  if command -v npx >/dev/null 2>&1; then printf 'npx'; return 0; fi
+  command -v mise >/dev/null 2>&1 || return 1
+  info "npx not found — asking mise for a node. The first time this takes a minute." >&2
+  local v
+  for v in lts 22; do
+    if mise x "node@$v" -- npx --version >/dev/null 2>&1; then
+      printf 'mise x node@%s -- npx' "$v"; return 0
+    fi
+  done
+  return 1
+}
+
 sdd_skill_field() {
   # sdd_skill_field <SKILL.md> <field>
   awk -v f="$2" '
@@ -1479,7 +1513,10 @@ cmd_sdd() {
     esac
   done
 
-  command -v npx >/dev/null 2>&1 || die "npx not found — install Node, then run this again."
+  local npx_run
+  npx_run="$(sdd_npx)" || die "npx not found, and mise could not provide a node.
+    mise use -g node@22        then run this again
+    or:  brew install node"
   git rev-parse --show-toplevel >/dev/null 2>&1 \
     || die "run this inside the course repository (cd ~/ai4dev/tinder4dogs)"
   local root; root="$(git rev-parse --show-toplevel)"
@@ -1505,10 +1542,12 @@ cmd_sdd() {
   fi
 
   info "installing cc-sdd $CC_SDD_VERSION for OpenCode…"
-  if ! npx -y "cc-sdd@$CC_SDD_VERSION" --opencode-skills --lang "$lang" --yes >/dev/null 2>&1; then
+  # unquoted on purpose: $npx_run may be "mise x node@lts -- npx", several words
+  # shellcheck disable=SC2086
+  if ! $npx_run -y "cc-sdd@$CC_SDD_VERSION" --opencode-skills --lang "$lang" --yes >/dev/null 2>&1; then
     [[ "$had_agents" -eq 1 ]] && cp "$agents_backup" AGENTS.md
     rm -f "$agents_backup"
-    die "cc-sdd failed. Run it by hand to see why:  npx -y cc-sdd@$CC_SDD_VERSION --opencode-skills --lang $lang --yes"
+    die "cc-sdd failed. Run it by hand to see why:  $npx_run -y cc-sdd@$CC_SDD_VERSION --opencode-skills --lang $lang --yes"
   fi
 
   if [[ "$had_agents" -eq 1 ]]; then
