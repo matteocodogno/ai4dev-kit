@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.16.0"
+readonly AI4DEV_VERSION="1.16.1"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -554,13 +554,19 @@ cmd_doctor() {
   # npx: only 'ai4dev sdd setup' needs it, and that is day 4 — so this is yellow
   # until the day it is load-bearing. The fix is one line and it is mise's job,
   # not homebrew's: nothing here wants a node installed globally.
-  if command -v npx >/dev/null 2>&1; then
-    ok "npx $(npx --version 2>/dev/null | head -1)"
+  local node_maj=""
+  if command -v npx >/dev/null 2>&1 && node_maj="$(node_major)" && [[ -n "$node_maj" ]] \
+     && [[ "$node_maj" -ge "$NODE_MIN_MAJOR" ]]; then
+    ok "node v$node_maj with npx $(npx --version 2>/dev/null | head -1)"
   elif command -v mise >/dev/null 2>&1; then
-    warn "npx not found — needed by 'ai4dev sdd setup' on day 4, not before"
+    if [[ -n "$node_maj" ]]; then
+      warn "node v$node_maj is too old for cc-sdd, which needs $NODE_MIN_MAJOR or newer"
+    else
+      warn "npx not found — needed by 'ai4dev sdd setup' on day 4, not before"
+    fi
     info "  mise use -g node@22        (ai4dev sdd setup will also ask mise itself)"
   else
-    bad "npx not found and no mise to get it from" "brew install node"
+    bad "no node $NODE_MIN_MAJOR+ and no mise to get one from" "brew install node"
   fi
 
   if command -v betterleaks >/dev/null 2>&1; then ok "betterleaks present"
@@ -1407,6 +1413,11 @@ cmd_module() {
 # The version is pinned. A course that installs "latest" is a course that
 # behaves differently in the afternoon than it did in rehearsal.
 readonly CC_SDD_VERSION="${AI4DEV_CC_SDD_VERSION:-3.1.0}"
+# cc-sdd imports node:readline/promises, which does not exist before Node 17,
+# and it declares no "engines" field — so npm installs it happily onto a Node
+# 16 and it dies at import time with ERR_UNKNOWN_BUILTIN_MODULE. 18 is the
+# oldest maintained line that has it.
+readonly NODE_MIN_MAJOR=18
 readonly SDD_MARK_BEGIN="<!-- ai4dev:cc-sdd:begin -->"
 readonly SDD_MARK_END="<!-- ai4dev:cc-sdd:end -->"
 
@@ -1430,16 +1441,36 @@ readonly SDD_MARK_END="<!-- ai4dev:cc-sdd:end -->"
 # one globally or touching anything the participant owns. We never take that on
 # faith: the probe below IS the proof, and if it does not answer we say what to
 # run rather than guessing.
+node_major() {
+  # node_major [<command prefix>] — prints the major version, or nothing
+  local out
+  out="$("$@" node --version 2>/dev/null)" || return 1
+  out="${out#v}"
+  [[ "$out" =~ ^[0-9]+ ]] || return 1
+  printf '%s' "${out%%.*}"
+}
+
 sdd_npx() {
-  # prints a command prefix able to run npx, or fails
-  if command -v npx >/dev/null 2>&1; then printf 'npx'; return 0; fi
+  # prints a command prefix able to run a new enough npx, or fails
+  local maj=""
+  if command -v npx >/dev/null 2>&1 && maj="$(node_major)" && [[ -n "$maj" ]] \
+     && [[ "$maj" -ge "$NODE_MIN_MAJOR" ]]; then
+    printf 'npx'; return 0
+  fi
+
+  if [[ -n "$maj" ]]; then
+    warn "your node is v$maj — cc-sdd needs $NODE_MIN_MAJOR or newer" >&2
+  fi
   command -v mise >/dev/null 2>&1 || return 1
-  info "npx not found — asking mise for a node. The first time this takes a minute." >&2
-  local v
+  info "asking mise for a node that can run it. The first time this takes a minute." >&2
+
+  local v got
   for v in lts 22; do
-    if mise x "node@$v" -- npx --version >/dev/null 2>&1; then
-      printf 'mise x node@%s -- npx' "$v"; return 0
-    fi
+    got="$(node_major mise x "node@$v" --)" || continue
+    [[ -n "$got" && "$got" -ge "$NODE_MIN_MAJOR" ]] || continue
+    mise x "node@$v" -- npx --version >/dev/null 2>&1 || continue
+    ok "mise gave us node v$got, just for this command" >&2
+    printf 'mise x node@%s -- npx' "$v"; return 0
   done
   return 1
 }
@@ -1514,7 +1545,7 @@ cmd_sdd() {
   done
 
   local npx_run
-  npx_run="$(sdd_npx)" || die "npx not found, and mise could not provide a node.
+  npx_run="$(sdd_npx)" || die "no node new enough for cc-sdd (it needs $NODE_MIN_MAJOR+), and mise could not provide one.
     mise use -g node@22        then run this again
     or:  brew install node"
   git rev-parse --show-toplevel >/dev/null 2>&1 \
