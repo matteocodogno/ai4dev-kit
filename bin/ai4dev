@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.16.1"
+readonly AI4DEV_VERSION="1.16.2"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -1450,6 +1450,25 @@ node_major() {
   printf '%s' "${out%%.*}"
 }
 
+# The four ways this fails in a room, each with a message that names the thing
+# to do rather than the thing that happened.
+sdd_explain_failure() {
+  local log="$1"
+  if grep -qi "ERR_UNKNOWN_BUILTIN_MODULE\|readline/promises" "$log"; then
+    warn "that is a node too old for cc-sdd: it needs $NODE_MIN_MAJOR or newer"
+    info "  mise use -g node@22        then run this again"
+  elif grep -qiE "ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|network|getaddrinfo|tunneling socket" "$log"; then
+    warn "npm could not reach the registry. On a corporate network that is a proxy,"
+    warn "and on a VPN it is usually the VPN itself."
+    info "  npm config get proxy https-proxy registry     to see what it is using"
+  elif grep -qiE "EACCES|EPERM|permission denied" "$log"; then
+    warn "npm was not allowed to write where it keeps its cache"
+    info "  npm config set cache ~/.npm-cache --global     then run this again"
+  elif grep -qiE "E404|not found.*cc-sdd|No matching version" "$log"; then
+    warn "npm cannot find cc-sdd@$CC_SDD_VERSION — check the version, or the registry you point at"
+  fi
+}
+
 sdd_npx() {
   # prints a command prefix able to run a new enough npx, or fails
   local maj=""
@@ -1573,13 +1592,26 @@ cmd_sdd() {
   fi
 
   info "installing cc-sdd $CC_SDD_VERSION for OpenCode…"
+  # Keep the output instead of throwing it away. "Run it by hand to see why" is
+  # a fine sentence to write and a terrible one to receive: it asks somebody
+  # who is already stuck to reproduce the failure before they can read it.
+  local log; log="$(mktemp)"
   # unquoted on purpose: $npx_run may be "mise x node@lts -- npx", several words
   # shellcheck disable=SC2086
-  if ! $npx_run -y "cc-sdd@$CC_SDD_VERSION" --opencode-skills --lang "$lang" --yes >/dev/null 2>&1; then
+  if ! $npx_run -y "cc-sdd@$CC_SDD_VERSION" --opencode-skills --lang "$lang" --yes >"$log" 2>&1; then
     [[ "$had_agents" -eq 1 ]] && cp "$agents_backup" AGENTS.md
     rm -f "$agents_backup"
-    die "cc-sdd failed. Run it by hand to see why:  $npx_run -y cc-sdd@$CC_SDD_VERSION --opencode-skills --lang $lang --yes"
+    bad "cc-sdd $CC_SDD_VERSION did not install"
+    sdd_explain_failure "$log"
+    printf '\n' >&2
+    info "what it printed:" >&2
+    tail -n 25 "$log" | sed 's/^/    /' >&2
+    printf '\n' >&2
+    info "the whole log is at $log"
+    info "the command it ran:  $npx_run -y cc-sdd@$CC_SDD_VERSION --opencode-skills --lang $lang --yes"
+    exit 1
   fi
+  rm -f "$log"
 
   if [[ "$had_agents" -eq 1 ]]; then
     local generated; generated="$(mktemp)"
