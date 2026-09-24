@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.15.0"
+readonly AI4DEV_VERSION="1.15.1"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -489,7 +489,7 @@ cmd_fork() {
   if gh api "repos/$who/$repo" --jq .name >/dev/null 2>&1; then
     ok "$who/$repo already exists"
   else
-    info "forking $src…"
+    info "forking ${src}…"
     gh repo fork "$src" --clone=false >/dev/null 2>&1 \
       || die "the fork did not happen. Run it by hand:  gh repo fork $src --clone=false"
     ok "forked to $who/$repo"
