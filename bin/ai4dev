@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.17.0"
+readonly AI4DEV_VERSION="1.17.1"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -365,16 +365,46 @@ https_base() {
 # had the day it was made and nothing after, so a clone that is not the course
 # repository needs somewhere to fetch them from: that is what `upstream` is for.
 ensure_upstream() {
-  local dir="$1" repo="$2" url="$AI4DEV_COURSE_BASE/$repo.git" origin=""
+  local dir="$1" repo="$2" origin="" ssh_url https_url url
   [[ -d "$dir/.git" ]] || return 0
+  ssh_url="$AI4DEV_COURSE_BASE/$repo.git"
+  https_url="$(https_base "$AI4DEV_COURSE_BASE")/$repo.git"
   origin="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+
   # same place: nothing to add
-  [[ "$origin" == "$url" || "$origin" == "$(https_base "$AI4DEV_COURSE_BASE")/$repo.git" ]] && return 0
+  [[ "$origin" == "$ssh_url" || "$origin" == "$https_url" ]] && return 0
+
+  # Take the protocol from origin. Somebody who cloned over https did so
+  # because ssh does not work for them — either no key on GitHub or port 22
+  # blocked — and handing them an ssh upstream hands them "Permission denied
+  # (publickey)" at the first fetch, days later, with nothing pointing back here.
+  if [[ "$origin" == https://* || "$origin" == http://* ]]; then
+    url="$https_url"
+  else
+    url="$ssh_url"
+  fi
+
   if git -C "$dir" remote get-url upstream >/dev/null 2>&1; then
     git -C "$dir" remote set-url upstream "$url"
   else
     git -C "$dir" remote add upstream "$url" 2>/dev/null || return 0
   fi
+
+  # And do not take it on faith. If it does not answer over ssh, try https:
+  # this also repairs a clone that an older version of this command got wrong.
+  if ! git -C "$dir" ls-remote --exit-code upstream >/dev/null 2>&1; then
+    if [[ "$url" != "$https_url" ]]; then
+      git -C "$dir" remote set-url upstream "$https_url"
+      if git -C "$dir" ls-remote --exit-code upstream >/dev/null 2>&1; then
+        info "upstream over ssh did not answer, so it is set to https instead"
+      else
+        warn "upstream is set, but neither ssh nor https could reach $repo"
+      fi
+    else
+      warn "upstream is set to $https_url, and it did not answer"
+    fi
+  fi
+
   git -C "$dir" fetch --tags --quiet upstream 2>/dev/null || true
   return 0
 }
