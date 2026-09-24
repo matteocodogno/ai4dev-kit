@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.16.2"
+readonly AI4DEV_VERSION="1.16.3"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -1457,6 +1457,17 @@ sdd_explain_failure() {
   if grep -qi "ERR_UNKNOWN_BUILTIN_MODULE\|readline/promises" "$log"; then
     warn "that is a node too old for cc-sdd: it needs $NODE_MIN_MAJOR or newer"
     info "  mise use -g node@22        then run this again"
+  elif grep -qE "UNABLE_TO_GET_ISSUER_CERT|SELF_SIGNED_CERT|DEPTH_ZERO_SELF_SIGNED|CERT_HAS_EXPIRED|unable to get local issuer certificate|self.signed certificate" "$log"; then
+    warn "something is intercepting TLS between you and the npm registry, and node"
+    warn "does not trust the certificate it is being shown. That is your company's"
+    warn "proxy or VPN, not a broken package."
+    info "  curl -sSI https://registry.npmjs.org/cc-sdd | head -1"
+    info "  if that answers 200, your system trusts the CA and node just is not"
+    info "  reading it. Point node at the same bundle:"
+    info "      export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt"
+    info "  if curl fails too, open npm for one install and close it again:"
+    info "      npm config set strict-ssl false && ai4dev sdd setup && npm config set strict-ssl true"
+    warn "NODE_TLS_REJECT_UNAUTHORIZED=0 does not help here: npm uses its own setting."
   elif grep -qiE "ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|network|getaddrinfo|tunneling socket" "$log"; then
     warn "npm could not reach the registry. On a corporate network that is a proxy,"
     warn "and on a VPN it is usually the VPN itself."
