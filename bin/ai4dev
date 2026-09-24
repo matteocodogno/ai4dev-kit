@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.16.3"
+readonly AI4DEV_VERSION="1.17.0"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -1450,6 +1450,25 @@ node_major() {
   printf '%s' "${out%%.*}"
 }
 
+sdd_is_cert_failure() {
+  grep -qE "UNABLE_TO_GET_ISSUER_CERT|SELF_SIGNED_CERT|DEPTH_ZERO_SELF_SIGNED|CERT_HAS_EXPIRED|unable to get local issuer certificate|self.signed certificate" "$1"
+}
+
+sdd_ca_bundle() {
+  local f
+  for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+    [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+sdd_install() {
+  # sdd_install <log> <npx prefix> <lang> [VAR=value ...]
+  local log="$1" npx_run="$2" lang="$3"; shift 3
+  # shellcheck disable=SC2086
+  env "$@" $npx_run -y "cc-sdd@$CC_SDD_VERSION" --opencode-skills --lang "$lang" --yes >"$log" 2>&1
+}
+
 # The four ways this fails in a room, each with a message that names the thing
 # to do rather than the thing that happened.
 sdd_explain_failure() {
@@ -1465,8 +1484,10 @@ sdd_explain_failure() {
     info "  if that answers 200, your system trusts the CA and node just is not"
     info "  reading it. Point node at the same bundle:"
     info "      export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt"
-    info "  if curl fails too, open npm for one install and close it again:"
-    info "      npm config set strict-ssl false && ai4dev sdd setup && npm config set strict-ssl true"
+    info "  if curl fails too, and only then:"
+    info "      ai4dev sdd setup --insecure"
+    info "  which turns verification off for that one command and writes nothing"
+    info "  anywhere. It is the smallest version of a bad idea, not a good one."
     warn "NODE_TLS_REJECT_UNAUTHORIZED=0 does not help here: npm uses its own setting."
   elif grep -qiE "ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|network|getaddrinfo|tunneling socket" "$log"; then
     warn "npm could not reach the registry. On a corporate network that is a proxy,"
@@ -1561,15 +1582,16 @@ cmd_sdd() {
       info "restart OpenCode and type / to see them"
       return 0
       ;;
-    *) die "usage: ai4dev sdd setup [--lang <code>] [--force] [--commands] · ai4dev sdd commands" ;;
+    *) die "usage: ai4dev sdd setup [--lang <code>] [--force] [--commands] [--insecure] · ai4dev sdd commands" ;;
   esac
 
-  local lang="en" force=0 want_commands=0
+  local lang="en" force=0 want_commands=0 insecure=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --lang)        lang="${2:-en}"; shift 2 ;;
       --force)       force=1; shift ;;
       --commands)    want_commands=1; shift ;;
+      --insecure)    insecure=1; shift ;;
       *) die "unknown option: $1" ;;
     esac
   done
@@ -1607,9 +1629,36 @@ cmd_sdd() {
   # a fine sentence to write and a terrible one to receive: it asks somebody
   # who is already stuck to reproduce the failure before they can read it.
   local log; log="$(mktemp)"
-  # unquoted on purpose: $npx_run may be "mise x node@lts -- npx", several words
-  # shellcheck disable=SC2086
-  if ! $npx_run -y "cc-sdd@$CC_SDD_VERSION" --opencode-skills --lang "$lang" --yes >"$log" 2>&1; then
+  local installed=0
+  sdd_install "$log" "$npx_run" "$lang" && installed=1
+
+  # A corporate proxy that re-signs TLS is the most common way this fails, and
+  # two of the three answers keep certificate verification on. Those two we try
+  # ourselves; the third turns verification off, and nobody's tool should do
+  # that on their behalf — it stays a thing you type.
+  local node_run="${npx_run%npx}node"
+  if [[ "$installed" -eq 0 ]] && sdd_is_cert_failure "$log"; then
+    warn "TLS between you and the npm registry is being intercepted"
+    # shellcheck disable=SC2086
+    if $node_run --use-system-ca -e '' >/dev/null 2>&1; then
+      info "retrying with the certificates your system already trusts"
+      sdd_install "$log" "$npx_run" "$lang" NODE_OPTIONS="--use-system-ca" && installed=1
+    fi
+  fi
+  if [[ "$installed" -eq 0 ]] && sdd_is_cert_failure "$log"; then
+    local bundle
+    if bundle="$(sdd_ca_bundle)"; then
+      info "retrying with $bundle"
+      sdd_install "$log" "$npx_run" "$lang" NODE_EXTRA_CA_CERTS="$bundle" && installed=1
+    fi
+  fi
+  if [[ "$installed" -eq 0 && "$insecure" -eq 1 ]] && sdd_is_cert_failure "$log"; then
+    warn "--insecure: certificate verification off, for this one command and nothing else"
+    sdd_install "$log" "$npx_run" "$lang" npm_config_strict_ssl=false && installed=1
+    [[ "$installed" -eq 1 ]] && warn "nothing was written to your npm config: the next command verifies again"
+  fi
+
+  if [[ "$installed" -eq 0 ]]; then
     [[ "$had_agents" -eq 1 ]] && cp "$agents_backup" AGENTS.md
     rm -f "$agents_backup"
     bad "cc-sdd $CC_SDD_VERSION did not install"
@@ -1892,6 +1941,8 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
                          course repository, keeping your own AGENTS.md
   ai4dev sdd commands    optional: make the /kiro-* phases show up in OpenCode's
                          slash menu. They already run without this
+                         setup --insecure: only when a company proxy re-signs
+                         TLS and no CA bundle on the machine covers it
   ai4dev mcp add github  connect GitHub's MCP server, with the token you are
                          already signed in with where there is one. GitHub has
                          no browser flow that works here: see the notes in mcp
