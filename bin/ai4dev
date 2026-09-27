@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.17.1"
+readonly AI4DEV_VERSION="1.18.1"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -1156,6 +1156,146 @@ version_ge() {
   (( a3 >= b3 ))
 }
 
+# ─── skill — install a published skill into YOUR kit ────────────────────────
+#
+# Module 3's rule, mechanised: a skill is true of you, so it lands in the kit
+# and is linked into OpenCode from there. Nothing is copied into a product
+# repository, and the kit is what goes home with you.
+#
+# Pinned to a commit, not to a branch: a skill that changes under the room
+# between the rehearsal and the day is the same failure as an unpinned npm
+# package, one layer up.
+readonly OWASP_REPO="OWASP/secure-agent-playbook"
+readonly OWASP_REF="1b5fd4cff76075feb56d61ee2985e82516f8c53b"   # main, 2026-09-25
+
+skill_raw_url() { printf 'https://raw.githubusercontent.com/%s/%s/%s' "$OWASP_REPO" "$OWASP_REF" "$1"; }
+
+skill_fetch() {
+  # skill_fetch <remote path> <local file>
+  local url dest code
+  url="$(skill_raw_url "$1")"; dest="$2"
+  mkdir -p "$(dirname "$dest")"
+  code="$(curl -sS --max-time 30 -o "$dest" -w '%{http_code}' "$url" 2>/dev/null || true)"
+  [[ "$code" == "200" && -s "$dest" ]] && return 0
+  rm -f "$dest"
+  warn "could not fetch $1 (HTTP ${code:-000})"
+  return 1
+}
+
+cmd_skill() {
+  load_config
+  local sub="${1:-}"; shift || true
+  local kit_skills="$AI4DEV_KIT/skills"
+  local oc_skills="$HOME/.config/opencode/skills"
+  local oc_command="$HOME/.config/opencode/command"
+
+  case "$sub" in
+    list)
+      [[ -d "$kit_skills" ]] || die "no skills directory in your kit ($kit_skills)"
+      local found=0 d name
+      for d in "$kit_skills"/*/; do
+        [[ -f "$d/SKILL.md" ]] || continue
+        found=1; name="$(basename "$d")"
+        local real; real="$(sdd_skill_field "$d/SKILL.md" name)"; [[ -n "$real" ]] || real="$name"
+        if [[ -e "$oc_skills/$real" || -e "$oc_skills/$name" ]]; then
+          ok "$name — OpenCode sees it as /$real"
+        else
+          warn "$name — in your kit, but not linked into OpenCode"
+          info "  ai4dev skill link $name"
+        fi
+      done
+      [[ "$found" -eq 1 ]] || info "no skills in your kit yet. Try: ai4dev skill add owasp-code-review"
+      ;;
+
+    link)
+      local name="${1:-}"; [[ -n "$name" ]] || die "usage: ai4dev skill link <name>"
+      [[ -f "$kit_skills/$name/SKILL.md" ]] || die "no skill called $name in $kit_skills"
+      local real; real="$(sdd_skill_field "$kit_skills/$name/SKILL.md" name)"; [[ -n "$real" ]] || real="$name"
+      mkdir -p "$oc_skills"
+      rm -rf "$oc_skills/$name" "$oc_skills/$real"
+      ln -s "$kit_skills/$name" "$oc_skills/$real"
+      ok "$name linked into OpenCode as /$real"
+      ;;
+
+    add)
+      local name="${1:-}"
+      command -v curl >/dev/null 2>&1 || die "curl not found"
+      local files=()
+      case "$name" in
+        owasp-code-review)
+          files=(
+            "plugins/code-security-skills/skills/code-review-security/SKILL.md|SKILL.md"
+            "plugins/code-security-skills/plays/code-review-security.md|plays/code-review-security.md"
+            "plugins/code-security-skills/templates/finding.md|templates/finding.md"
+          )
+          ;;
+        *)
+          die "unknown skill: ${name:-<none>}
+    ai4dev skill add owasp-code-review     OWASP security code review (Top 10 / ASVS)"
+          ;;
+      esac
+
+      local dest="$kit_skills/$name"
+      if [[ -f "$dest/SKILL.md" && "${2:-}" != "--force" ]]; then
+        ok "$name is already in your kit"
+        info "re-download with: ai4dev skill add $name --force"
+      else
+        info "fetching $name from $OWASP_REPO@${OWASP_REF:0:7}…"
+        local pair remote local_path
+        for pair in "${files[@]}"; do
+          remote="${pair%%|*}"; local_path="${pair#*|}"
+          skill_fetch "$remote" "$dest/$local_path" || {
+            rm -rf "$dest"
+            die "the download failed. A company proxy that re-signs TLS breaks this
+    the same way it breaks npm: try  curl -sSI $(skill_raw_url "$remote") | head -1"
+          }
+        done
+        # The skill points at plays/ and templates/ relatively, and OpenCode tells
+        # the model the skill's own directory, so keeping the layout is the whole
+        # install: nothing is rewritten.
+        ok "$name is in your kit: $dest"
+      fi
+
+      # OpenCode keys a skill by the `name:` in its frontmatter, not by the
+      # directory it sits in. Measured: a skill in a directory called
+      # owasp-code-review registers as `code-review-security`, because that is
+      # what its own file says. So the command below must name THAT, or the
+      # model is told to load a skill that does not exist.
+      local real; real="$(sdd_skill_field "$dest/SKILL.md" name)"
+      [[ -n "$real" ]] || real="$name"
+
+      mkdir -p "$oc_skills"
+      rm -rf "$oc_skills/$name" "$oc_skills/$real"
+      ln -s "$dest" "$oc_skills/$real"
+      ok "linked into OpenCode as '$real', for every repository you work in"
+
+      # A skill is reachable by typing its exact name, but the palette does not
+      # suggest one. This is the entry that makes it discoverable.
+      mkdir -p "$oc_command"
+      {
+        printf -- '---\n'
+        printf 'description: "OWASP security review of a change (Top 10 / ASVS)"\n'
+        printf -- '---\n\n'
+        printf 'Load the `%s` skill with the skill tool and follow its procedure.\n\n' "$real"
+        printf 'Review the change described below, not the whole repository:\n\n'
+        printf '<scope>\n'
+        printf '%s\n' '$ARGUMENTS'
+        printf '</scope>\n\n'
+        printf 'If the scope is empty, review the uncommitted diff and the last commit.\n'
+        printf 'Cite file and line for every finding, and rate its severity.\n'
+      } > "$oc_command/$name.md"
+      ok "/$name in the slash menu, and /$real works too (skills answer to their own name)"
+      printf '\n'
+      info "commit it, it is yours:"
+      info "  cd \$AI4DEV_KIT && git add skills/$name && ai4dev commit"
+      ;;
+
+    *)
+      die "usage: ai4dev skill add <name> [--force] · ai4dev skill list · ai4dev skill link <name>"
+      ;;
+  esac
+}
+
 cmd_upgrade() {
   load_config
 
@@ -1969,6 +2109,9 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
                          working tree. --checkout puts it side by side
   ai4dev sdd setup       install the spec-driven harness (cc-sdd) into the
                          course repository, keeping your own AGENTS.md
+  ai4dev skill add <n>   install a published skill into your kit and link it into
+                         OpenCode. owasp-code-review is the OWASP security review
+  ai4dev skill list      what your kit has, and whether OpenCode can see it
   ai4dev sdd commands    optional: make the /kiro-* phases show up in OpenCode's
                          slash menu. They already run without this
                          setup --insecure: only when a company proxy re-signs
@@ -2008,6 +2151,7 @@ main() {
     config)  shift; cmd_config  "$@" ;;
     module)  shift; cmd_module  "$@" ;;
     sdd)     shift; cmd_sdd     "$@" ;;
+    skill)   shift; cmd_skill   "$@" ;;
     mcp)     shift; cmd_mcp     "$@" ;;
     version|--version|-v) printf 'ai4dev %s\n' "$AI4DEV_VERSION" ;;
     help|--help|-h) usage ;;
