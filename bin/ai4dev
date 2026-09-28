@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.19.2"
+readonly AI4DEV_VERSION="1.19.3"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -1533,7 +1533,11 @@ module_fetch() {
     MODULE_FETCH_OK=0     # nothing to fetch from, and the tag check says so in words
     return 0
   fi
-  if git fetch --tags --quiet "$remote" 2>/dev/null; then
+  # --force matters: git refuses to move a tag ref that already exists locally,
+  # and a module tag DOES get re-cut while a module is being prepared. Without it
+  # a laptop that fetched the old tag once keeps it for ever and silently starts
+  # the module from the wrong commit, which is worse than an error.
+  if git fetch --tags --force --quiet "$remote" 2>/dev/null; then
     MODULE_FETCH_OK=1
   else
     MODULE_FETCH_OK=0
