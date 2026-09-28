@@ -31,7 +31,8 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.19.1"
+readonly AI4DEV_VERSION="1.19.2"
+MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -1439,7 +1440,7 @@ module_tag_or_die() {
   # A missing tag has two very different causes, and the old message named the
   # wrong one. If the tag exists in the OTHER course repository, that is what
   # happened, and saying so is the whole fix.
-  local tag="$1" in_repo="$2" shown="$3" where="$4" tail="${5:-that module has not been prepared}"
+  local tag="$1" in_repo="$2" shown="$3" where="$4" tail="${5:-}"
   git rev-parse -q --verify "refs/tags/$tag" >/dev/null && return 0
 
   local other other_repo
@@ -1453,7 +1454,27 @@ module_tag_or_die() {
     fi
     die "$tag is not in $in_repo, it is in $other. Drop --legacy, or run it from $other_repo"
   fi
-  die "$tag does not exist in $in_repo — $tail"
+  # A tag that is not here has two remaining causes, and they need different
+  # actions: it was never pushed, or we could not reach the remote to find out.
+  # The old message said "that module has not been prepared" for both, which is
+  # a guess dressed as a diagnosis.
+  local remote url
+  remote="$(module_remote)"
+  url="$(git remote get-url "$remote" 2>/dev/null || true)"
+  if [[ -z "$url" ]]; then
+    die "$tag does not exist in $in_repo, and this clone has no remote to fetch tags from"
+  fi
+  local msg="$tag does not exist in $in_repo"
+  if [[ "$MODULE_FETCH_OK" -eq 1 ]]; then
+    msg="$msg
+       fetched from $remote ($url) and it has no such tag: it has not been pushed yet"
+  else
+    msg="$msg
+       and $remote could not be reached, so this may be a tag you have simply not fetched"
+  fi
+  [[ -n "$tail" ]] && msg="$msg
+       $tail"
+  die "$msg"
 }
 module_repo_from_cwd() {
   # `ai4dev module` used to ignore the directory you were standing in entirely:
@@ -1500,13 +1521,24 @@ module_number() {
   printf '%02d' "$((10#$raw))"
 }
 
-module_fetch() {
+module_remote() {
   # Tags come from the course repository. On a fork that is 'upstream'; on a
-  # direct clone origin is the course repository and there is no upstream.
-  local remote="origin"
-  git remote get-url upstream >/dev/null 2>&1 && remote="upstream"
-  git fetch --tags --quiet "$remote" 2>/dev/null \
-    || warn "could not reach $remote, using the tags you already have"
+  # direct clone origin IS the course repository and there is no upstream.
+  git remote get-url upstream >/dev/null 2>&1 && { printf 'upstream'; return 0; }
+  printf 'origin'
+}
+module_fetch() {
+  local remote; remote="$(module_remote)"
+  if ! git remote get-url "$remote" >/dev/null 2>&1; then
+    MODULE_FETCH_OK=0     # nothing to fetch from, and the tag check says so in words
+    return 0
+  fi
+  if git fetch --tags --quiet "$remote" 2>/dev/null; then
+    MODULE_FETCH_OK=1
+  else
+    MODULE_FETCH_OK=0
+    warn "could not reach $remote, using the tags you already have"
+  fi
 }
 
 module_require_clean() {
