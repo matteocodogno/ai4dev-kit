@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.19.0"
+readonly AI4DEV_VERSION="1.19.1"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -1435,6 +1435,47 @@ module_repo() {
   [[ -d "$repo/.git" ]] || die "no $name clone at $repo — run: ai4dev init"
   printf '%s' "$repo"
 }
+module_tag_or_die() {
+  # A missing tag has two very different causes, and the old message named the
+  # wrong one. If the tag exists in the OTHER course repository, that is what
+  # happened, and saying so is the whole fix.
+  local tag="$1" in_repo="$2" shown="$3" where="$4" tail="${5:-that module has not been prepared}"
+  git rev-parse -q --verify "refs/tags/$tag" >/dev/null && return 0
+
+  local other other_repo
+  if [[ "$in_repo" == "tinder4dogs" ]]; then other="tinder4dogs-legacy"; else other="tinder4dogs"; fi
+  other_repo="${AI4DEV_WORKSPACE:-$HOME/ai4dev}/$other"
+
+  if [[ -d "$other_repo/.git" ]] \
+     && git -C "$other_repo" rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1; then
+    if [[ "$other" == "tinder4dogs-legacy" ]]; then
+      die "$tag is not in $in_repo, it is in $other. Add --legacy:  ai4dev module $shown $where --legacy"
+    fi
+    die "$tag is not in $in_repo, it is in $other. Drop --legacy, or run it from $other_repo"
+  fi
+  die "$tag does not exist in $in_repo — $tail"
+}
+module_repo_from_cwd() {
+  # `ai4dev module` used to ignore the directory you were standing in entirely:
+  # it resolved the product repo from AI4DEV_WORKSPACE and cd'd there. So
+  # `ai4dev module 9 start` typed INSIDE the legacy twin looked for the tag in
+  # the product and reported that the module had not been prepared, which is a
+  # lie with a plausible shape. The working directory is the clearest statement
+  # of intent a user can make; --legacy stays as the override for when you are
+  # somewhere else.
+  local here base name repo
+  here="$(pwd -P 2>/dev/null)" || return 1
+  base="${AI4DEV_WORKSPACE:-$HOME/ai4dev}"
+  for name in tinder4dogs-legacy tinder4dogs; do
+    repo="$base/$name"
+    [[ -d "$repo/.git" ]] || continue
+    repo="$(cd "$repo" 2>/dev/null && pwd -P)" || continue
+    if [[ "$here" == "$repo" || "$here" == "$repo"/* ]]; then
+      printf '%s' "$name"; return 0
+    fi
+  done
+  return 1
+}
 module_baseline_files() {
   # What a module's start commit INTRODUCED, as opposed to everything the tag
   # contains. That difference is the whole point of --onto: a participant who
@@ -1481,7 +1522,7 @@ module_require_clean() {
 cmd_module() {
   load_config          # AI4DEV_WORKSPACE lives in the config, not in the air
   local n where repo tag branch
-  local which_repo="tinder4dogs" onto=0 mode="how"
+  local which_repo="" onto=0 mode="how" inferred=""
 
   # Flags are read out of the arguments first, so that a flag can appear
   # anywhere. The old version read the mode from a fixed position, which meant
@@ -1514,6 +1555,17 @@ cmd_module() {
   }
   where="${2:-start}"
   local shown="${n#0}"          # "04" is right for a tag and wrong in a sentence
+
+  if [[ -z "$which_repo" ]]; then
+    if inferred="$(module_repo_from_cwd)"; then
+      which_repo="$inferred"
+      [[ "$which_repo" != "tinder4dogs" ]] \
+        && info "working in $which_repo, because that is where you are standing"
+    else
+      which_repo="tinder4dogs"
+    fi
+  fi
+
   repo="$(module_repo "$which_repo")"
   cd "$repo" || die "cannot enter $repo"
 
@@ -1522,8 +1574,7 @@ cmd_module() {
       tag="module-${n}-start"
       branch="m${n}"
       module_fetch
-      git rev-parse -q --verify "refs/tags/$tag" >/dev/null \
-        || die "$tag does not exist yet — that module has not been prepared"
+      module_tag_or_die "$tag" "$which_repo" "$shown" "$where"
       module_require_clean
 
       if [[ "$onto" -eq 1 ]]; then
@@ -1536,6 +1587,12 @@ cmd_module() {
         done < <(module_baseline_files "$tag")
         [[ ${#files[@]} -gt 0 ]] \
           || die "$tag introduces no files of its own, so there is no baseline to apply"
+        if [[ "$from" == "main" || "$from" == "master" ]]; then
+          warn "you are on $from, so --onto adds the baseline to a branch with no work of your own"
+          local same="ai4dev module $shown start"
+          [[ "$which_repo" == "tinder4dogs-legacy" ]] && same="$same --legacy"
+          info "  that is the same result as:  $same"
+        fi
         git switch -C "$branch" --quiet || die "could not create $branch"
         git checkout "$tag" -- "${files[@]}" \
           || die "could not take the baseline files out of $tag"
@@ -1576,8 +1633,8 @@ cmd_module() {
       tag="module-${n}-end"
       base="module-${n}-start"
       module_fetch
-      git rev-parse -q --verify "refs/tags/$tag" >/dev/null \
-        || die "$tag does not exist yet — the solution is published after the module"
+      module_tag_or_die "$tag" "$which_repo" "$shown" "$where" \
+        "the solution is published after the module"
 
       case "$mode" in
         checkout)
@@ -2169,9 +2226,11 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
                          uncommitted work rather than throwing it away
   ai4dev module N end    show how module N was solved, WITHOUT touching your
                          working tree. --checkout puts it side by side
-                         both take --legacy to work in tinder4dogs-legacy, and
-                         start takes --onto to keep the branch you are on and
-                         add only the files that module introduces
+                         both work in whichever course repository you are
+                         standing in; --legacy picks the legacy twin from
+                         anywhere else. start also takes
+                         --onto to keep the branch you are on and add only the
+                         files that module introduces
   ai4dev sdd setup       install the spec-driven harness (cc-sdd) into the
                          course repository, keeping your own AGENTS.md
   ai4dev skill add <n>   install a published skill into your kit and link it into
