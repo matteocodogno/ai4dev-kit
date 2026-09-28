@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.19.3"
+readonly AI4DEV_VERSION="1.20.0"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -1827,7 +1827,10 @@ sdd_explain_failure() {
 }
 
 sdd_npx() {
-  # prints a command prefix able to run a new enough npx, or fails
+  # prints a command prefix able to run a new enough npx, or fails.
+  # $1 names what needs it, because this is no longer only cc-sdd's problem and
+  # a message that says "cc-sdd" while you are adding an MCP server is a lie.
+  local what="${1:-cc-sdd}"
   local maj=""
   if command -v npx >/dev/null 2>&1 && maj="$(node_major)" && [[ -n "$maj" ]] \
      && [[ "$maj" -ge "$NODE_MIN_MAJOR" ]]; then
@@ -1835,7 +1838,7 @@ sdd_npx() {
   fi
 
   if [[ -n "$maj" ]]; then
-    warn "your node is v$maj — cc-sdd needs $NODE_MIN_MAJOR or newer" >&2
+    warn "your node is v$maj — $what needs $NODE_MIN_MAJOR or newer" >&2
   fi
   command -v mise >/dev/null 2>&1 || return 1
   info "asking mise for a node that can run it. The first time this takes a minute." >&2
@@ -2057,6 +2060,46 @@ cmd_sdd() {
 #
 # --oauth is still there for a server that does support registration.
 readonly GITHUB_MCP_URL="https://api.githubcopilot.com/mcp/"
+# Unpinned on purpose, because that is what was asked for. Module 8 argues the
+# other way about the OWASP skill, and the same argument applies here: pin it
+# before a course day with AI4DEV_PLAYWRIGHT_MCP_VERSION=<version>.
+readonly PLAYWRIGHT_MCP_PKG="@playwright/mcp@${AI4DEV_PLAYWRIGHT_MCP_VERSION:-latest}"
+
+mcp_add_playwright() {
+  # A LOCAL (stdio) server, unlike github's remote one: OpenCode spawns the
+  # process itself, so the command in the config has to be one this machine can
+  # really run. Writing a bare "npx" would be a promise about a PATH nobody
+  # checked, which is exactly how day 4 stopped; sdd_npx already knows how to
+  # find a node new enough or borrow one from mise, so reuse it.
+  #
+  # The schema is measured against OpenCode 1.18.31, not guessed: a server needs
+  # type "local" or "remote", and omitting type is rejected with
+  #   Expected { readonly "type": "local", ... } | { readonly "type": "remote", ... }
+  command -v jq >/dev/null 2>&1 || die "jq not found. brew install jq"
+  local npx_run cmd_json
+  npx_run="$(sdd_npx "the Playwright MCP server")" \
+    || die "no node $NODE_MIN_MAJOR+ and no mise to get one from.  brew install node"
+
+  # shellcheck disable=SC2086
+  cmd_json="$(printf '%s\n' $npx_run "$PLAYWRIGHT_MCP_PKG" | jq -R . | jq -s .)"
+  mcp_write_block playwright \
+    "$(jq -n --argjson c "$cmd_json" '{type:"local", command:$c, enabled:true}')"
+
+  ok "playwright added to $OPENCODE_CONFIG_FILE"
+  info "  command: $npx_run $PLAYWRIGHT_MCP_PKG"
+  printf '\n'
+  info "tools load when a session starts, so start a new one:  ai4dev code"
+  info "then check that it answered:                           ai4dev mcp list"
+  printf '\n'
+  warn "the first launch needs a browser, and that is not a small download"
+  info "  warm it up before you need it:  $npx_run playwright install chrome"
+  if [[ "$PLAYWRIGHT_MCP_PKG" == *@latest ]]; then
+    info "  nothing is pinned: AI4DEV_PLAYWRIGHT_MCP_VERSION=<version> pins it"
+  fi
+  printf '\n'
+  warn "this one drives a real browser on your machine, and nothing prompts you"
+  info "  before an MCP tool runs. Point it at localhost, not at your tabs."
+}
 
 github_token_from_somewhere() {
   local t=""
@@ -2150,7 +2193,12 @@ cmd_mcp() {
       ;;
     add)
       local what="${1:-}"; shift || true
-      [[ "$what" == "github" ]] || die "usage: ai4dev mcp add github [--oauth]"
+      if [[ "$what" == "playwright" ]]; then
+        mcp_add_playwright "$@"
+        return 0
+      fi
+      [[ "$what" == "github" ]] \
+        || die "usage: ai4dev mcp add github [--oauth] · ai4dev mcp add playwright"
       local mode="token"
       [[ "${1:-}" == "--oauth" ]] && mode="oauth"
       [[ "${1:-}" == "--token" ]] && mode="token"   # accepted, it is the default
@@ -2232,7 +2280,7 @@ cmd_mcp() {
       info "comparison worth making before you keep this."
       ;;
     *)
-      die "usage: ai4dev mcp add github [--token] · ai4dev mcp list · ai4dev mcp remove <name>"
+      die "usage: ai4dev mcp add github [--token] · ai4dev mcp add playwright · ai4dev mcp list · ai4dev mcp remove <name>"
       ;;
   esac
 }
@@ -2279,6 +2327,10 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
   ai4dev mcp add github  connect GitHub's MCP server, with the token you are
                          already signed in with where there is one. GitHub has
                          no browser flow that works here: see the notes in mcp
+  ai4dev mcp add playwright
+                         connect the Playwright MCP server, which drives a real
+                         browser on this machine. Local, not remote: it needs a
+                         node new enough, and the first launch downloads a browser
   ai4dev mcp list        what is connected, and whether it authenticated
   ai4dev mcp remove <n>  disconnect one, and stop paying for its definitions
   ai4dev upgrade         update the tool from the course, leaving your work alone
