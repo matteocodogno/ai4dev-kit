@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.18.1"
+readonly AI4DEV_VERSION="1.19.0"
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
 # here is yours: your prompts once you have edited them, your checklists, your
@@ -1427,9 +1427,26 @@ cmd_config() {
 #     something to compare against, not something to be overwritten by.
 
 module_repo() {
-  local repo="${AI4DEV_WORKSPACE:-$HOME/ai4dev}/tinder4dogs"
-  [[ -d "$repo/.git" ]] || die "no course repository at $repo — run: ai4dev init"
+  # Which of the two course repositories a module runs in. The product is the
+  # default because most modules live there; the legacy twin is the brownfield
+  # one, and from module 8 onwards it has module tags of its own.
+  local name="${1:-tinder4dogs}"
+  local repo="${AI4DEV_WORKSPACE:-$HOME/ai4dev}/$name"
+  [[ -d "$repo/.git" ]] || die "no $name clone at $repo — run: ai4dev init"
   printf '%s' "$repo"
+}
+module_baseline_files() {
+  # What a module's start commit INTRODUCED, as opposed to everything the tag
+  # contains. That difference is the whole point of --onto: a participant who
+  # already has work of their own needs the module's toolchain, not a tree that
+  # would replace what they wrote. Falls back to the whole tree for a root
+  # commit, which is the only case where "introduced" means everything.
+  local tag="$1"
+  if git rev-parse -q --verify "${tag}^{commit}^" >/dev/null 2>&1; then
+    git diff --name-only --diff-filter=d "${tag}^" "$tag"
+  else
+    git ls-tree -r --name-only "$tag"
+  fi
 }
 
 module_number() {
@@ -1464,18 +1481,40 @@ module_require_clean() {
 cmd_module() {
   load_config          # AI4DEV_WORKSPACE lives in the config, not in the air
   local n where repo tag branch
+  local which_repo="tinder4dogs" onto=0 mode="how"
+
+  # Flags are read out of the arguments first, so that a flag can appear
+  # anywhere. The old version read the mode from a fixed position, which meant
+  # `module 9 end --mine` and `module 9 --mine end` did different things.
+  local a; local args=()
+  for a in "$@"; do
+    case "$a" in
+      --legacy)   which_repo="tinder4dogs-legacy" ;;
+      --onto)     onto=1 ;;
+      --checkout) mode="checkout" ;;
+      --mine)     mode="mine" ;;
+      -*)         die "unknown option: $a" ;;
+      *)          args+=("$a") ;;
+    esac
+  done
+  if [[ ${#args[@]} -gt 0 ]]; then set -- "${args[@]}"; else set --; fi
+
   n="$(module_number "${1:-}")" || {
-    printf 'usage: ai4dev module <number> start\n'
-    printf '       ai4dev module <number> end [--mine|--checkout]\n\n'
+    printf 'usage: ai4dev module <number> start [--legacy] [--onto]\n'
+    printf '       ai4dev module <number> end [--mine|--checkout] [--legacy]\n\n'
     info "start              put me at the beginning of the module, on my own branch"
+    info "start --onto       keep the branch I am on and take only the files the"
+    info "                   module itself adds — the toolchain, not my work"
     info "end                show me how it was solved, as a diff"
     info "end --mine         show me how far my work is from it"
     info "end --checkout     put the solution on a branch beside mine, so I can run it"
+    printf '\n'
+    info "--legacy           work in tinder4dogs-legacy instead of the product"
     exit 2
   }
   where="${2:-start}"
   local shown="${n#0}"          # "04" is right for a tag and wrong in a sentence
-  repo="$(module_repo)"
+  repo="$(module_repo "$which_repo")"
   cd "$repo" || die "cannot enter $repo"
 
   case "$where" in
@@ -1486,6 +1525,35 @@ cmd_module() {
       git rev-parse -q --verify "refs/tags/$tag" >/dev/null \
         || die "$tag does not exist yet — that module has not been prepared"
       module_require_clean
+
+      if [[ "$onto" -eq 1 ]]; then
+        local from f; local files=()
+        from="$(git rev-parse --abbrev-ref HEAD)"
+        [[ "$from" != "HEAD" ]] \
+          || die "you are on a detached HEAD, so there is no branch to build onto"
+        while IFS= read -r f; do
+          [[ -n "$f" ]] && files+=("$f")
+        done < <(module_baseline_files "$tag")
+        [[ ${#files[@]} -gt 0 ]] \
+          || die "$tag introduces no files of its own, so there is no baseline to apply"
+        git switch -C "$branch" --quiet || die "could not create $branch"
+        git checkout "$tag" -- "${files[@]}" \
+          || die "could not take the baseline files out of $tag"
+        git add -- "${files[@]}"
+        if git diff --cached --quiet; then
+          ok "you are on $branch: the module $shown baseline was already here"
+        else
+          git commit --quiet -m "chore: module $shown baseline from $tag" \
+            || die "could not commit the baseline"
+          ok "you are on $branch, built on $from, with the module $shown baseline applied"
+        fi
+        printf '\n'
+        info "taken from the tag:  ${files[*]}"
+        info "kept:                everything else you had on $from"
+        info "the tag itself:      $tag"
+        return 0
+      fi
+
       git switch -C "$branch" "$tag" --quiet \
         || die "could not switch to $tag"
       ok "you are at the start of module $shown, on branch $branch"
@@ -1510,12 +1578,6 @@ cmd_module() {
       module_fetch
       git rev-parse -q --verify "refs/tags/$tag" >/dev/null \
         || die "$tag does not exist yet — the solution is published after the module"
-
-      local mode="how"
-      case "${3:-${1:-}}" in
-        --checkout) mode="checkout" ;;
-        --mine)     mode="mine" ;;
-      esac
 
       case "$mode" in
         checkout)
@@ -2107,6 +2169,9 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
                          uncommitted work rather than throwing it away
   ai4dev module N end    show how module N was solved, WITHOUT touching your
                          working tree. --checkout puts it side by side
+                         both take --legacy to work in tinder4dogs-legacy, and
+                         start takes --onto to keep the branch you are on and
+                         add only the files that module introduces
   ai4dev sdd setup       install the spec-driven harness (cc-sdd) into the
                          course repository, keeping your own AGENTS.md
   ai4dev skill add <n>   install a published skill into your kit and link it into
