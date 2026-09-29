@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.20.0"
+readonly AI4DEV_VERSION="1.21.0"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -1555,6 +1555,83 @@ module_require_clean() {
   exit 1
 }
 
+cmd_agent() {
+  # `opencode agent create` asks a MODEL to write the agent file, so it needs the
+  # gateway key — and a bare `opencode` never gets one. The OpenCode config
+  # refers to the key by NAME, `{env:AI4DEV_API_KEY}`, and only this CLI puts a
+  # value behind that name for the process it hands over to. Run directly, the
+  # request goes out with an empty Bearer, the gateway answers 401, and what
+  # comes back talks about a model rather than a credential. It is the same
+  # shape as `opencode mcp list`, and the same fix: export, then hand over.
+  load_config
+  local sub="${1:-}"; shift || true
+  command -v opencode >/dev/null 2>&1 \
+    || die "opencode not found. Install it with:  brew install anomalyco/tap/opencode"
+
+  case "$sub" in
+    list)
+      # No model is called here, so no key is needed. It is in this command so
+      # that "which agents do I have" is one habit and not two tools, and
+      # because its exit code is the check that catches a broken agent file.
+      exec opencode agent list
+      ;;
+    create)
+      require_gateway
+      local key
+      key="$(fetch_key)" || die \
+        "no virtual key yet, and 'agent create' asks a model to write the file. Paste the one from your Slack DM into $CONFIG_FILE, then try again."
+
+      # Two defaults, so that the command in the room is short enough to type
+      # without a mistake: the kit's agents directory, and a model alias
+      # qualified the way `ai4dev code` qualifies it.
+      local a args=() has_path=0 has_model=0 qualified=""
+      while [[ $# -gt 0 ]]; do
+        a="$1"; shift
+        case "$a" in
+          --path) has_path=1; args+=("$a"); [[ $# -gt 0 ]] && { args+=("$1"); shift; } ;;
+          --path=*) has_path=1; args+=("$a") ;;
+          -m|--model)
+            has_model=1; args+=("$a")
+            if [[ $# -gt 0 ]]; then
+              if [[ "$1" != */* ]]; then qualified="$1"; args+=("ai4dev/$1"); else args+=("$1"); fi
+              shift
+            fi ;;
+          -m=*|--model=*)
+            has_model=1
+            if [[ "${a#*=}" != */* ]]; then
+              qualified="${a#*=}"; args+=("${a%%=*}=ai4dev/${a#*=}")
+            else args+=("$a"); fi ;;
+          *) args+=("$a") ;;
+        esac
+      done
+      if [[ "$has_path" -eq 0 ]]; then
+        mkdir -p "$AI4DEV_KIT/agents"
+        args+=(--path "$AI4DEV_KIT/agents")
+        info "writing into $AI4DEV_KIT/agents — an agent is yours, not the product's" >&2
+      fi
+      if [[ "$has_model" -eq 0 ]]; then
+        args+=(-m "ai4dev/$AI4DEV_OPENCODE_MODEL")
+        qualified="$AI4DEV_OPENCODE_MODEL"
+      fi
+      [[ -n "$qualified" ]] && info "model: ai4dev/$qualified" >&2
+      warn "this spends tokens: a model writes the file, it does not template it" >&2
+
+      export AI4DEV_API_KEY="$key"
+      exec opencode agent create ${args[@]+"${args[@]}"}
+      ;;
+    *)
+      printf 'usage: ai4dev agent create [--mode primary|subagent|all] [--permissions "read,grep,..."]\n'
+      printf '                           [--description "..."] [-m <alias>] [--path DIR]\n'
+      printf '       ai4dev agent list\n\n'
+      info "create    a model writes the agent file. Defaults to your kit's agents/ and"
+      info "          your default alias, and needs your key — which a bare 'opencode"
+      info "          agent create' never has"
+      info "list      every agent OpenCode can see. Exits 1 and names the file when one"
+      info "          of them is malformed, which takes all of them down"
+      exit 2
+      ;;
+  esac
+}
 cmd_module() {
   load_config          # AI4DEV_WORKSPACE lives in the config, not in the air
   local n where repo tag branch
@@ -2315,6 +2392,10 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
                          anywhere else. start also takes
                          --onto to keep the branch you are on and add only the
                          files that module introduces
+  ai4dev agent create    have a model write an agent file into your kit. Needs your
+                         key, which a bare 'opencode agent create' cannot have
+  ai4dev agent list      every agent OpenCode can see. Exits 1 and names the file
+                         when one is malformed — and one malformed file hides them all
   ai4dev sdd setup       install the spec-driven harness (cc-sdd) into the
                          course repository, keeping your own AGENTS.md
   ai4dev skill add <n>   install a published skill into your kit and link it into
@@ -2362,6 +2443,7 @@ main() {
     key)     shift; cmd_key     "$@" ;;
     config)  shift; cmd_config  "$@" ;;
     module)  shift; cmd_module  "$@" ;;
+    agent)   shift; cmd_agent   "$@" ;;
     sdd)     shift; cmd_sdd     "$@" ;;
     skill)   shift; cmd_skill   "$@" ;;
     mcp)     shift; cmd_mcp     "$@" ;;
