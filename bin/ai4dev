@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.22.0"
+readonly AI4DEV_VERSION="1.23.0"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -1141,6 +1141,248 @@ cmd_code() {
   local gh_token; gh_token="$(github_token_resolve)"
   [[ -n "$gh_token" ]] && export AI4DEV_GITHUB_TOKEN="$gh_token"
   exec opencode ${args[@]+"${args[@]}"}
+}
+
+# ─── the local model ─────────────────────────────────────────────────────────
+#
+# What this command does NOT do is the point of it. It never calls
+# require_gateway, never reads the virtual key, and never speaks to the course
+# gateway. Pull the network cable and it still works.
+#
+# That is the demonstration, not a side effect. Code that must not leave the
+# building does not leave it, and the proof is the Langfuse dashboard that stays
+# empty while you work. If this command ever starts touching the gateway "just
+# for telemetry", it has destroyed the thing it exists to show.
+
+readonly OLLAMA_URL_DEFAULT="http://localhost:11434"
+readonly LOCAL_MODEL_NAME="ai4dev-local"   # our own tag, so its origin is obvious
+readonly LOCAL_CTX_DEFAULT=16384
+
+local_ram_gb() {
+  local bytes kb
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    bytes="$(sysctl -n hw.memsize 2>/dev/null)" || return 1
+    [[ -n "$bytes" ]] || return 1
+    printf '%s' $(( bytes / 1024 / 1024 / 1024 ))
+  else
+    kb="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null)" || return 1
+    [[ -n "$kb" ]] || return 1
+    printf '%s' $(( kb / 1024 / 1024 ))
+  fi
+}
+
+# Picked from RAM, because ten people guessing is ten different Labs.
+#
+# All three carry Ollama's `tools` capability, and that is the non-negotiable
+# part: without function calling OpenCode is a chat window, not an agent.
+# qwen2.5-coder is the pick everyone reaches for first and it is deliberately
+# NOT here — it does not advertise tools. qwen3-coder starts at 30b, which is
+# not a laptop.
+local_pick_model() {
+  [[ -z "${AI4DEV_LOCAL_BASE:-}" ]] || { printf '%s' "$AI4DEV_LOCAL_BASE"; return 0; }
+  local ram; ram="$(local_ram_gb 2>/dev/null || true)"
+  if   [[ -z "$ram" || "$ram" -lt 12 ]]; then printf 'qwen3:4b'
+  elif [[ "$ram" -lt 24 ]];              then printf 'qwen3:8b'
+  else                                        printf 'qwen3:14b'
+  fi
+}
+
+local_ollama_up() { curl -sS --max-time 3 -o /dev/null "$1/api/tags" 2>/dev/null; }
+
+# Resolve where Ollama actually listens. On WSL with Ollama installed on the
+# WINDOWS side, localhost is the Linux VM and Ollama is on the host, reachable
+# at the default route — an address that changes on every restart of either.
+# Nothing here writes it down permanently: `ai4dev local` re-resolves it and
+# rewrites the provider block on every run, which is why a config that worked
+# yesterday still works today.
+local_ollama_url() {
+  local url host
+  if [[ -n "${AI4DEV_OLLAMA_URL:-}" ]]; then printf '%s' "${AI4DEV_OLLAMA_URL%/}"; return 0; fi
+  url="$OLLAMA_URL_DEFAULT"
+  local_ollama_up "$url" && { printf '%s' "$url"; return 0; }
+  if grep -qi microsoft /proc/version 2>/dev/null; then
+    host="$(ip route show default 2>/dev/null | awk '{print $3; exit}')"
+    if [[ -n "$host" ]] && local_ollama_up "http://$host:11434"; then
+      printf 'http://%s:11434' "$host"; return 0
+    fi
+  fi
+  printf '%s' "$url"   # hand back the default so the failure names something real
+}
+
+local_have_model() {
+  # <url> <name> → 0 when Ollama already serves that exact tag
+  curl -sS --max-time 5 "$1/api/tags" 2>/dev/null \
+    | jq -e --arg n "$2" '[.models[]?.name] | any(. == $n or . == ($n + ":latest"))' >/dev/null 2>&1
+}
+
+# The check that decides whether any of this can work. A model that answers in
+# prose instead of calling the tool cannot drive OpenCode, and it fails in the
+# most expensive way: it looks like it is working.
+local_tools_ok() {
+  local url="$1" model="$2" body resp
+  body="$(jq -n --arg m "$model" '{
+    model: $m, stream: false,
+    messages: [{ role: "user", content: "List the files in this project. Use the tool." }],
+    tools: [{ type: "function", function: {
+      name: "list_files", description: "List the files in the project",
+      parameters: { type: "object", properties: {} } } }]
+  }')"
+  resp="$(curl -sS --max-time 180 -H 'Content-Type: application/json' \
+           -d "$body" "$url/v1/chat/completions" 2>/dev/null)" || return 1
+  printf '%s' "$resp" | jq -e '(.choices[0].message.tool_calls // []) | length > 0' >/dev/null 2>&1
+}
+
+# Writes ONLY .provider.ollama (or .providers.ollama on v2). The ai4dev block,
+# the permission block Module 4 edits, and the mcp servers are all untouched —
+# same rule sync_opencode_config follows, for the same reason.
+local_write_provider() {
+  local url="$1" model="$2" existing tmp major prog
+  major="$(opencode_major 2>/dev/null || true)"; [[ -n "$major" ]] || major=1
+  existing='{}'
+  if [[ -f "$OPENCODE_CONFIG_FILE" ]]; then
+    existing="$(jq '.' "$OPENCODE_CONFIG_FILE" 2>/dev/null)" \
+      || die "$OPENCODE_CONFIG_FILE is not valid JSON — fix it, or: ai4dev code --reconfigure"
+  fi
+  # apiKey is a placeholder: Ollama ignores it, but OpenAI-compatible clients
+  # commonly refuse to start with the field empty.
+  if [[ "$major" == "1" ]]; then
+    prog='.provider.ollama = {
+            npm: "@ai-sdk/openai-compatible",
+            name: "Ollama (local — nothing leaves this machine)",
+            options: { baseURL: ($url + "/v1"), apiKey: "ollama" },
+            models: { ($model): { name: ($model + " (local)") } }
+          }'
+  else
+    prog='.providers.ollama = {
+            package: "aisdk:@ai-sdk/openai-compatible",
+            name: "Ollama (local — nothing leaves this machine)",
+            settings: { baseURL: ($url + "/v1"), apiKey: "ollama" },
+            models: { ($model): { name: ($model + " (local)") } }
+          }'
+  fi
+  mkdir -p "$(dirname "$OPENCODE_CONFIG_FILE")"
+  tmp="$OPENCODE_CONFIG_FILE.tmp.$$"
+  printf '%s' "$existing" | jq --arg url "$url" --arg model "$model" "$prog" > "$tmp" \
+    || { rm -f "$tmp"; die "could not write $tmp"; }
+  mv "$tmp" "$OPENCODE_CONFIG_FILE"
+}
+
+local_unreachable() {
+  bad "no Ollama at $1"
+  info "  is it running?            ollama serve   (or the menu-bar app)"
+  info "  on WSL with Ollama on Windows, all three of these are needed:"
+  info "    1. on Windows:  setx OLLAMA_HOST \"0.0.0.0\"   then restart Ollama"
+  info "    2. reach it:    .wslconfig networkingMode=mirrored, or the default route"
+  info "    3. the firewall: mirrored mode needs a Hyper-V rule for TCP 11434"
+  info "  or point it yourself:     AI4DEV_OLLAMA_URL=http://HOST:11434 ai4dev local"
+  exit 1
+}
+
+cmd_local() {
+  load_config
+  command -v jq   >/dev/null 2>&1 || die "jq not found. brew install jq"
+  command -v curl >/dev/null 2>&1 || die "curl not found"
+
+  local sub="run"
+  case "${1:-}" in
+    setup|check|run) sub="$1"; shift ;;
+    -h|--help)
+      printf 'usage: ai4dev local [setup|check|run]\n\n'
+      printf '  setup   pull the model, bake the context window in, wire OpenCode,\n'
+      printf '          and refuse to say ready unless function calling works\n'
+      printf '  check   re-run the verification only\n'
+      printf '  run     open OpenCode on the local model (the default)\n\n'
+      printf '  No key, no gateway, no network. That is the point.\n\n'
+      printf '  AI4DEV_OLLAMA_URL   where Ollama listens (default %s)\n' "$OLLAMA_URL_DEFAULT"
+      printf '  AI4DEV_LOCAL_BASE   override the model chosen from your RAM\n'
+      printf '  AI4DEV_LOCAL_CTX    context window to bake in (default %s)\n' "$LOCAL_CTX_DEFAULT"
+      return 0 ;;
+  esac
+
+  local url; url="$(local_ollama_url)"
+
+  case "$sub" in
+    setup)
+      local_ollama_up "$url" || local_unreachable "$url"
+      ok "Ollama reachable at $url"
+
+      command -v ollama >/dev/null 2>&1 || {
+        bad "the 'ollama' command is not on this machine, only its API is"
+        info "That is normal on WSL when Ollama runs on Windows. Do the two"
+        info "preparation steps THERE, then come back and run: ai4dev local check"
+        info ""
+        # info() takes ONE argument. Building these with printf-style extra
+        # args printed a literal %s, and the person on the other end would have
+        # pasted a Modelfile with "%s" in it. Interpolate first, print second.
+        local _base _ctx
+        _base="$(local_pick_model)"; _ctx="${AI4DEV_LOCAL_CTX:-$LOCAL_CTX_DEFAULT}"
+        info "  ollama pull $_base"
+        info "  printf 'FROM $_base\\nPARAMETER num_ctx $_ctx\\n' > Modelfile"
+        info "  ollama create $LOCAL_MODEL_NAME -f Modelfile"
+        exit 1
+      }
+
+      local base ctx ram mf
+      base="$(local_pick_model)"
+      ctx="${AI4DEV_LOCAL_CTX:-$LOCAL_CTX_DEFAULT}"
+      ram="$(local_ram_gb 2>/dev/null || true)"
+      info "RAM: ${ram:-unknown} GB  →  $base"
+      warn "this download is gigabytes. Do it before the room, not in it."
+
+      ollama pull "$base" || die "could not pull $base"
+
+      # Ollama defaults to 4096 tokens of context and TRUNCATES SILENTLY past
+      # it. OpenCode's system prompt and tool schemas exceed that on their own,
+      # so the model would receive a mutilated prompt and behave at random with
+      # no error anywhere. And because OpenCode speaks the OpenAI API, it cannot
+      # ask for more: num_ctx is an Ollama-native option. It has to be baked in.
+      mf="$(mktemp -t ai4dev-modelfile.XXXXXX)"
+      printf 'FROM %s\nPARAMETER num_ctx %s\n' "$base" "$ctx" > "$mf"
+      info "creating $LOCAL_MODEL_NAME with num_ctx=$ctx"
+      ollama create "$LOCAL_MODEL_NAME" -f "$mf" || { rm -f "$mf"; die "could not create $LOCAL_MODEL_NAME"; }
+      rm -f "$mf"
+
+      local_write_provider "$url" "$LOCAL_MODEL_NAME"
+      ok "wrote the ollama provider into $OPENCODE_CONFIG_FILE"
+      info "your ai4dev provider, permissions and MCP servers were not touched"
+
+      cmd_local check
+      ;;
+
+    check)
+      local_ollama_up "$url" || local_unreachable "$url"
+      ok "Ollama reachable at $url"
+      local_have_model "$url" "$LOCAL_MODEL_NAME" \
+        || die "$LOCAL_MODEL_NAME is not there yet. Run:  ai4dev local setup"
+      ok "$LOCAL_MODEL_NAME is loaded"
+      info "checking function calling — without it OpenCode is a chat window, not an agent"
+      if local_tools_ok "$url" "$LOCAL_MODEL_NAME"; then
+        ok "function calling works — ai4dev local is ready"
+      else
+        bad "$LOCAL_MODEL_NAME answered without calling the tool"
+        info "OpenCode cannot drive it. Try a different base model:"
+        info "  AI4DEV_LOCAL_BASE=qwen3:8b ai4dev local setup"
+        exit 1
+      fi
+      ;;
+
+    run)
+      command -v opencode >/dev/null 2>&1 \
+        || die "opencode not found. Install it with:  $OPENCODE_INSTALL_HINT"
+      local_ollama_up "$url" || local_unreachable "$url"
+      local_have_model "$url" "$LOCAL_MODEL_NAME" \
+        || die "$LOCAL_MODEL_NAME is not there yet. Run:  ai4dev local setup"
+
+      # Rewritten every run on purpose: on WSL the Windows host address changes
+      # across restarts, and a baseURL written yesterday is the classic
+      # "it worked yesterday" failure.
+      local_write_provider "$url" "$LOCAL_MODEL_NAME"
+
+      info "model: ollama/$LOCAL_MODEL_NAME  at  $url" >&2
+      info "no key, no gateway, no trace in Langfuse. Your code stays here." >&2
+      exec opencode -m "ollama/$LOCAL_MODEL_NAME" ${1+"$@"}
+      ;;
+  esac
 }
 
 cmd_costs() {
@@ -2536,6 +2778,7 @@ main() {
     doctor)  shift; cmd_doctor  "$@" ;;
     ask)     shift; cmd_ask     "$@" ;;
     code)    shift; cmd_code    "$@" ;;
+    local)   shift; cmd_local   "$@" ;;
     review)  shift; cmd_review  "$@" ;;
     commit)  shift; cmd_commit  "$@" ;;
     costs)   shift; cmd_costs   "$@" ;;
