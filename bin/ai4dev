@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.23.0"
+readonly AI4DEV_VERSION="1.23.1"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -1638,17 +1638,31 @@ cmd_upgrade() {
   [[ -d "$kit/.git" ]] || die "$kit is not a git repository. Re-clone your kit and copy your work across."
   git -C "$kit" remote get-url origin >/dev/null 2>&1 || die "this kit has no 'origin' remote, so there is nothing to upgrade from."
 
-  # Your own edits to a course-owned file would be overwritten. Stop instead.
-  if ! git -C "$kit" diff --quiet -- "${COURSE_OWNED[@]}" 2>/dev/null \
-     || ! git -C "$kit" diff --cached --quiet -- "${COURSE_OWNED[@]}" 2>/dev/null; then
-    bad "you have uncommitted changes in ${COURSE_OWNED[*]}"
-    info "commit or stash them first: the upgrade would overwrite them."
-    exit 1
-  fi
-
+  # The fetch moved ABOVE the dirty check on purpose: deciding whether those
+  # changes are yours requires knowing what the course currently ships.
   info "fetching from $(git -C "$kit" remote get-url origin)"
   git -C "$kit" fetch --quiet origin main 2>/dev/null \
     || die "could not reach the course repository. Check your network, then try again."
+
+  # Your own edits to a course-owned file would be overwritten. Stop instead.
+  #
+  # Unless they are not your edits. An upgrade whose commit failed leaves
+  # exactly these files modified and byte-for-byte identical to what the course
+  # ships. This guard would then refuse to run, so the repository could never
+  # become clean again and every later upgrade would hit the same wall. That is
+  # a trap, not a safeguard. Recognise that shape and finish the job the earlier
+  # run started, instead of blaming the person for work they never did.
+  if ! git -C "$kit" diff --quiet -- "${COURSE_OWNED[@]}" 2>/dev/null \
+     || ! git -C "$kit" diff --cached --quiet -- "${COURSE_OWNED[@]}" 2>/dev/null; then
+    if git -C "$kit" diff --quiet origin/main -- "${COURSE_OWNED[@]}" 2>/dev/null; then
+      warn "an earlier upgrade updated these files but could not commit them"
+      info "they are identical to the course's copy, so this is not your work — finishing it"
+    else
+      bad "you have uncommitted changes in ${COURSE_OWNED[*]}"
+      info "commit or stash them first: the upgrade would overwrite them."
+      exit 1
+    fi
+  fi
 
   local changed
   changed="$(git -C "$kit" diff --name-only HEAD origin/main -- "${COURSE_OWNED[@]}" 2>/dev/null || true)"
@@ -1686,8 +1700,40 @@ cmd_upgrade() {
   printf '\n'
 
   git -C "$kit" checkout origin/main -- "${COURSE_OWNED[@]}"
-  git -C "$kit" commit --quiet -m "kit: update the ai4dev tool from the course" -- "${COURSE_OWNED[@]}" \
-    || info "nothing to commit — the files were already staged as they are"
+
+  # The commit is what makes the upgrade STICK. The checkout above has already
+  # put the new files in the working tree, so the tool will run either way —
+  # which is exactly why a failure here is so easy to miss.
+  #
+  # If it fails and we carry on: HEAD never moves, the files sit modified
+  # forever, and the NEXT upgrade computes the same difference and does the same
+  # thing again. The command reports success every time and the repository never
+  # looks clean. That happened to a participant whose git had no user.email, and
+  # the old code made it invisible three ways at once — it printed "nothing to
+  # commit" over the top of git's own error, then a green "upgraded" line, and
+  # exited 0.
+  if git -C "$kit" diff --cached --quiet -- "${COURSE_OWNED[@]}" \
+     && git -C "$kit" diff --quiet -- "${COURSE_OWNED[@]}"; then
+    info "nothing to commit — the files were already as the course has them"
+  else
+    local commit_err
+    if ! commit_err="$(git -C "$kit" commit --quiet \
+           -m "kit: update the ai4dev tool from the course" -- "${COURSE_OWNED[@]}" 2>&1)"; then
+      bad "the tool files were updated, but the commit failed"
+      printf '\n'
+      printf '%s\n' "$commit_err" | sed 's/^/    /' >&2
+      printf '\n'
+      info "Your copy of the tool IS the new one and it will run. What is broken is"
+      info "that the change was never recorded, so 'ai4dev upgrade' will do this"
+      info "again every time and your repository will never look clean."
+      printf '\n'
+      info "Almost always, git does not know who you are yet:"
+      info "  git config --global user.name  \"Your Name\""
+      info "  git config --global user.email \"you@example.com\""
+      info "then run 'ai4dev upgrade' once more."
+      exit 1
+    fi
+  fi
 
   # This script has just overwritten itself while running. Bash has already read
   # and parsed everything it needs (every command lives inside a function, and
