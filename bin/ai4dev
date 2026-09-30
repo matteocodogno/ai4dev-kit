@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.21.1"
+readonly AI4DEV_VERSION="1.22.0"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -49,6 +49,22 @@ readonly CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ai4dev/config"
 # XDG_CONFIG_HOME, so neither do we here: a path we invent is a path OpenCode
 # will not read.
 readonly OPENCODE_CONFIG_FILE="$HOME/.config/opencode/opencode.json"
+
+# The OpenCode this course is MEASURED on. Everything Module 11 teaches about
+# agent files — that `tools:` must be a map, the exact error a YAML list gives,
+# the fact that Claude Code's capitalisation is accepted and enforces nothing —
+# was measured against this version and is not portable to v2, which renamed
+# the frontmatter (`prompt`→`system`, `permission`→`permissions`,
+# `subtask`→`subagent`) and the provider block (`provider`→`providers`,
+# `npm`→`package`, `options`→`settings`).
+#
+# The install hint is npm AND PINNED on purpose. brew and the curl installer
+# track whatever OpenCode ships today, so following them mid-course puts one
+# person on a different major than the room — which is exactly how a
+# participant ended up on 2.0.20 while everyone else was on 1.x, and spent a
+# Lab chasing an empty Bearer.
+readonly OPENCODE_PINNED="1.18.33"
+readonly OPENCODE_INSTALL_HINT="npm i -g opencode-ai@$OPENCODE_PINNED"
 
 # The kit is this script's own repository: bin/ai4dev -> repo root.
 KIT_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -629,15 +645,29 @@ cmd_doctor() {
   # install before day 1. An unwired opencode is not — the config needs the
   # gateway URL and a key, and the key only exists once you are in the room.
   if command -v opencode >/dev/null 2>&1; then
-    local ocv; ocv="$(opencode --version 2>/dev/null | head -1)"
-    ok "opencode ${ocv:-present}"
-    if [[ -f "$OPENCODE_CONFIG_FILE" ]] && jq -e '.provider.ai4dev' "$OPENCODE_CONFIG_FILE" >/dev/null 2>&1; then
+    # Both guarded: opencode_version ends in a grep, and a version string we
+    # cannot parse must not take the whole doctor down with it under set -e.
+    local ocv ocm
+    ocv="$(opencode_version 2>/dev/null || true)"
+    ocm="$(opencode_major   2>/dev/null || true)"
+    if [[ -z "$ocm" || "$ocm" == "1" ]]; then
+      ok "opencode ${ocv:-present}"
+    else
+      # Yellow, not red: it runs, and 'ai4dev code' writes the shape it wants.
+      # What it cannot do is behave like the rest of the room during Module 11.
+      warn "opencode ${ocv:-present} — this course is measured on $OPENCODE_PINNED"
+      info "v$ocm renamed the agent frontmatter and the provider block, so agent"
+      info "files and error messages differ from the ones used in the exercises."
+      info "to match the room:  $OPENCODE_INSTALL_HINT"
+    fi
+    if [[ -f "$OPENCODE_CONFIG_FILE" ]] \
+       && jq -e '.provider.ai4dev // .providers.ai4dev' "$OPENCODE_CONFIG_FILE" >/dev/null 2>&1; then
       ok "opencode points at the course gateway"
     else
       warn "opencode is not wired to the gateway yet — 'ai4dev code' writes that config the first time you run it"
     fi
   else
-    bad "opencode not found" "brew install anomalyco/tap/opencode   (or: curl -fsSL https://opencode.ai/install | bash)"
+    bad "opencode not found" "$OPENCODE_INSTALL_HINT"
   fi
 
   # kit and workspace
@@ -911,6 +941,33 @@ gateway_model_ids() {
       | select(length > 0)' 2>/dev/null
 }
 
+# `opencode --version` prints a bare semver on 1.x. Parse defensively: any
+# line, first semver found, and treat "cannot tell" as 1 so a machine we cannot
+# read keeps the behaviour it had before this function existed.
+# Said once, where it matters, instead of guessing a shape we cannot test.
+# `sync_opencode_config` knows both provider shapes because the migration guide
+# documents them. These two do not: the guide says nothing about the `mcp`
+# block, and nothing about whether v2's `agent create --path` still appends
+# "agents" the way 1.18.x does (measured: it does, which is why we pass the kit
+# root). Warn, act anyway, and let the person see the cause if it misbehaves.
+opencode_v2_unverified() {
+  local what="$1" m; m="$(opencode_major 2>/dev/null || true)"
+  [[ -n "$m" && "$m" != "1" ]] || return 0
+  warn "opencode v$m: $what is only measured on $OPENCODE_PINNED" >&2
+  info "if it lands in the wrong place or is ignored, that is the reason" >&2
+}
+
+opencode_version() {
+  command -v opencode >/dev/null 2>&1 || return 1
+  opencode --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+}
+
+opencode_major() {
+  local v; v="$(opencode_version)" || return 1
+  [[ -n "$v" ]] || return 1
+  printf '%s' "${v%%.*}"
+}
+
 sync_opencode_config() {
   # Rewrites ONLY .provider.ai4dev and .model, and leaves the rest of the file
   # exactly as it was. That matters more than it sounds: Module 4 has people
@@ -918,6 +975,13 @@ sync_opencode_config() {
   # regenerates the whole thing would delete an exercise.
   local key="${1:-}" force="${2:-0}"
   local ids default existing before_list before_model after_list after_model tmp
+  local oc_major pkey jq_prog
+
+  # Unreadable version → assume 1. The v1 shape is the one this course has run
+  # on for ten days; it is the safe default, not v2.
+  oc_major="$(opencode_major 2>/dev/null || true)"
+  [[ -n "$oc_major" ]] || oc_major=1
+  pkey="provider"; [[ "$oc_major" == "1" ]] || pkey="providers"
 
   existing='{}'
   if [[ -f "$OPENCODE_CONFIG_FILE" ]]; then
@@ -947,29 +1011,54 @@ sync_opencode_config() {
     default="$(printf '%s' "$ids" | jq -r '.[0]')"
   fi
 
-  before_list="$(printf '%s' "$existing" | jq -c '(.provider.ai4dev.models // {}) | keys')"
+  before_list="$(printf '%s' "$existing" | jq -c --arg p "$pkey" '(.[$p].ai4dev.models // {}) | keys')"
   before_model="$(printf '%s' "$existing" | jq -r '.model // ""')"
 
   mkdir -p "$(dirname "$OPENCODE_CONFIG_FILE")"
   tmp="$OPENCODE_CONFIG_FILE.tmp.$$"
+  # Neither branch deletes the other one's block. A machine that changes major
+  # version keeps a stale block for the version it is not running, which costs
+  # nothing and means downgrading back to the pinned version needs no repair.
+  if [[ "$oc_major" == "1" ]]; then
+    jq_prog='
+        .["$schema"] = (.["$schema"] // "https://opencode.ai/config.json")
+      | .provider.ai4dev = {
+          npm: "@ai-sdk/openai-compatible",
+          name: "AI4Dev gateway",
+          options: { baseURL: $url, apiKey: "{env:AI4DEV_API_KEY}" },
+          models: (
+            $ids
+            | map({ key: ., value: { name: (if . == $default then . + " (default)" else . end) } })
+            | from_entries
+          )
+        }
+      | .model = ("ai4dev/" + $default)'
+  else
+    # v2 shape, from the official v1→v2 migration guide. NOT measured: no v2
+    # binary was reachable when this was written. `{env:VAR}` is documented as
+    # still supported, which is the part that matters most here. $schema is
+    # deliberately left alone: the v1 URL would be wrong and the v2 one is
+    # unknown, and a wrong one is worse than none.
+    jq_prog='
+        .providers.ai4dev = {
+          package: "aisdk:@ai-sdk/openai-compatible",
+          name: "AI4Dev gateway",
+          settings: { baseURL: $url, apiKey: "{env:AI4DEV_API_KEY}" },
+          models: (
+            $ids
+            | map({ key: ., value: { name: (if . == $default then . + " (default)" else . end) } })
+            | from_entries
+          )
+        }
+      | .model = ("ai4dev/" + $default)'
+  fi
+
   printf '%s' "$existing" | jq \
-    --arg url "$AI4DEV_GATEWAY_URL" --arg default "$default" --argjson ids "$ids" '
-      .["$schema"] = (.["$schema"] // "https://opencode.ai/config.json")
-    | .provider.ai4dev = {
-        npm: "@ai-sdk/openai-compatible",
-        name: "AI4Dev gateway",
-        options: { baseURL: $url, apiKey: "{env:AI4DEV_API_KEY}" },
-        models: (
-          $ids
-          | map({ key: ., value: { name: (if . == $default then . + " (default)" else . end) } })
-          | from_entries
-        )
-      }
-    | .model = ("ai4dev/" + $default)
-  ' > "$tmp" || { rm -f "$tmp"; die "could not write $tmp"; }
+    --arg url "$AI4DEV_GATEWAY_URL" --arg default "$default" --argjson ids "$ids" \
+    "$jq_prog" > "$tmp" || { rm -f "$tmp"; die "could not write $tmp"; }
   mv "$tmp" "$OPENCODE_CONFIG_FILE"
 
-  after_list="$(jq -c '.provider.ai4dev.models | keys' "$OPENCODE_CONFIG_FILE")"
+  after_list="$(jq -c --arg p "$pkey" '.[$p].ai4dev.models | keys' "$OPENCODE_CONFIG_FILE")"
   after_model="$(jq -r '.model' "$OPENCODE_CONFIG_FILE")"
 
   if [[ "$before_list" != "$after_list" || "$before_model" != "$after_model" || "$force" -eq 1 ]]; then
@@ -995,7 +1084,7 @@ cmd_code() {
   done
 
   command -v opencode >/dev/null 2>&1 \
-    || die "opencode not found. Install it with:  brew install anomalyco/tap/opencode   (or: curl -fsSL https://opencode.ai/install | bash)"
+    || die "opencode not found. Install it with:  $OPENCODE_INSTALL_HINT"
   command -v jq >/dev/null 2>&1 || die "jq not found. brew install jq"
 
   local key
@@ -1566,7 +1655,7 @@ cmd_agent() {
   load_config
   local sub="${1:-}"; shift || true
   command -v opencode >/dev/null 2>&1 \
-    || die "opencode not found. Install it with:  brew install anomalyco/tap/opencode"
+    || die "opencode not found. Install it with:  $OPENCODE_INSTALL_HINT"
 
   case "$sub" in
     list)
@@ -1625,6 +1714,7 @@ cmd_agent() {
       [[ -n "$qualified" ]] && info "model: ai4dev/$qualified" >&2
       warn "this spends tokens: a model writes the file, it does not template it" >&2
 
+      opencode_v2_unverified "where 'agent create --path' writes the file"
       export AI4DEV_API_KEY="$key"
       exec opencode agent create ${args[@]+"${args[@]}"}
       ;;
@@ -2236,6 +2326,7 @@ github_token_resolve() {
 mcp_write_block() {
   # mcp_write_block <name> <json for that server>
   local name="$1" block="$2" tmp existing
+  opencode_v2_unverified "the 'mcp' config block"
   mkdir -p "$(dirname "$OPENCODE_CONFIG_FILE")"
   existing='{}'
   if [[ -f "$OPENCODE_CONFIG_FILE" ]]; then
