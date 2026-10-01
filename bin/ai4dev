@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.23.1"
+readonly AI4DEV_VERSION="1.24.0"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -1853,25 +1853,28 @@ module_tag_or_die() {
        $tail"
   die "$msg"
 }
-module_repo_from_cwd() {
-  # `ai4dev module` used to ignore the directory you were standing in entirely:
-  # it resolved the product repo from AI4DEV_WORKSPACE and cd'd there. So
-  # `ai4dev module 9 start` typed INSIDE the legacy twin looked for the tag in
-  # the product and reported that the module had not been prepared, which is a
-  # lie with a plausible shape. The working directory is the clearest statement
-  # of intent a user can make; --legacy stays as the override for when you are
-  # somewhere else.
-  local here base name repo
-  here="$(pwd -P 2>/dev/null)" || return 1
-  base="${AI4DEV_WORKSPACE:-$HOME/ai4dev}"
-  for name in tinder4dogs-legacy tinder4dogs; do
-    repo="$base/$name"
-    [[ -d "$repo/.git" ]] || continue
-    repo="$(cd "$repo" 2>/dev/null && pwd -P)" || continue
-    if [[ "$here" == "$repo" || "$here" == "$repo"/* ]]; then
-      printf '%s' "$name"; return 0
-    fi
-  done
+module_repo_from_cwd() {   # echoes an ABSOLUTE PATH, not a name
+  # The working directory is the clearest statement of intent a user can make,
+  # and this function exists to honour it. It used to honour it only INSIDE
+  # AI4DEV_WORKSPACE, which quietly broke the moment someone kept a second
+  # clone — a very normal thing to have.
+  #
+  # Standing in that second clone, `ai4dev module 4 start` walked off to the
+  # workspace copy, switched the branch THERE, printed "you are at the start of
+  # module 4, on branch m04", and exited 0. The person's own repository had not
+  # moved, `git status` still said main, and nothing in the output named the
+  # directory that had actually been touched. Every word was true and the whole
+  # thing was wrong.
+  #
+  # Now: if you are inside a git repository whose top level is named after a
+  # course repository, that is the one, wherever it lives on disk.
+  local top base
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+  top="$(cd "$top" 2>/dev/null && pwd -P)" || return 1
+  base="$(basename "$top")"
+  case "$base" in
+    tinder4dogs|tinder4dogs-legacy) printf '%s' "$top"; return 0 ;;
+  esac
   return 1
 }
 module_baseline_files() {
@@ -2056,18 +2059,45 @@ cmd_module() {
   where="${2:-start}"
   local shown="${n#0}"          # "04" is right for a tag and wrong in a sentence
 
-  if [[ -z "$which_repo" ]]; then
-    if inferred="$(module_repo_from_cwd)"; then
-      which_repo="$inferred"
-      [[ "$which_repo" != "tinder4dogs" ]] \
-        && info "working in $which_repo, because that is where you are standing"
-    else
-      which_repo="tinder4dogs"
-    fi
-  fi
+  # `ai4dev module 4 start --checkout` used to accept the flag and ignore it,
+  # so you got the plain `start` behaviour and no hint that half your command
+  # had been dropped. Say so instead.
+  case "$where" in
+    start)
+      [[ "$mode" == "how" ]] \
+        || die "--${mode} belongs to 'end', not 'start'. Did you mean: ai4dev module $shown end --$mode"
+      ;;
+    end)
+      [[ "$onto" -eq 0 ]] \
+        || die "--onto belongs to 'start', not 'end'. Did you mean: ai4dev module $shown start --onto"
+      ;;
+  esac
 
-  repo="$(module_repo "$which_repo")"
+  if [[ -n "$which_repo" ]]; then
+    # An explicit --legacy typed from inside a course clone means the twin
+    # NEXT TO the one you are standing in, when there is one. Jumping to the
+    # workspace copy from a directory you deliberately chose would be the same
+    # surprise this command has just stopped making.
+    local here_repo="" sibling=""
+    if here_repo="$(module_repo_from_cwd 2>/dev/null)"; then
+      sibling="$(dirname "$here_repo")/$which_repo"
+      [[ -d "$sibling/.git" ]] || sibling=""
+    fi
+    if [[ -n "$sibling" ]]; then repo="$sibling"
+    else                        repo="$(module_repo "$which_repo")"; fi
+  elif inferred="$(module_repo_from_cwd)"; then
+    repo="$inferred"
+    which_repo="$(basename "$repo")"
+  else
+    which_repo="tinder4dogs"
+    repo="$(module_repo "$which_repo")"
+  fi
   cd "$repo" || die "cannot enter $repo"
+
+  # Printed every time, not only when something surprising happened. This
+  # command rewrites branches; the one fact you always need is WHICH working
+  # copy it is about to rewrite them in.
+  info "repository: $repo"
 
   case "$where" in
     start)
