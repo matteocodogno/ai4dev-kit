@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.25.0"
+readonly AI4DEV_VERSION="1.25.1"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -63,6 +63,10 @@ readonly OPENCODE_CONFIG_FILE="$HOME/.config/opencode/opencode.json"
 # person on a different major than the room — which is exactly how a
 # participant ended up on 2.0.20 while everyone else was on 1.x, and spent a
 # Lab chasing an empty Bearer.
+# Lines of staged diff above which `ai4dev commit` summarises instead of
+# sending the whole thing. Generous on purpose: the point is to catch the
+# lockfile and the first commit, not to clip ordinary work.
+readonly COMMIT_DIFF_MAX_LINES="${AI4DEV_COMMIT_DIFF_MAX_LINES:-1500}"
 readonly OPENCODE_PINNED="1.18.33"
 readonly OPENCODE_INSTALL_HINT="npm i -g opencode-ai@$OPENCODE_PINNED"
 
@@ -282,22 +286,36 @@ call() {
   # "safe" default is the liability Module 2 Part 1 describes: it works until
   # the alias is repointed at a reasoning model, and then it is a hard 400 on a
   # call whose code never changed.
-  payload="$(jq -n --arg model "$role" --arg content "$prompt" --argjson metadata "$meta_json" \
-    '{model: $model, messages: [{role: "user", content: $content}], metadata: $metadata}')"
+  #
+  # The prompt arrives on STDIN, not as --arg. A staged diff or a long file is
+  # easily megabytes, and an argument that size fails execve with "Argument
+  # list too long". jq then produced nothing, $payload was empty, and the
+  # request went out anyway — so the gateway answered "Missing required
+  # parameter: 'messages'", an error pointing nowhere near the cause. A shell
+  # variable has no such limit and printf is a builtin, so nothing is exec'd.
+  payload="$(printf '%s' "$prompt" | jq -Rs --arg model "$role" --argjson metadata "$meta_json" \
+    '{model: $model, messages: [{role: "user", content: .}], metadata: $metadata}')" \
+    || die "could not build the request body"
+  [[ -n "$payload" ]] || die "the request body came out empty — nothing was sent"
   if [[ -n "$temp" ]]; then
     payload="$(printf '%s' "$payload" | jq --argjson t "$temp" '. + {temperature: $t}')"
   fi
 
-  local body_file hdr_file
-  body_file="$(mktemp)"; hdr_file="$(mktemp)"
-  trap 'rm -f "$body_file" "$hdr_file"' RETURN
+  # Same limit, one step later: -d "$payload" is an argv argument too, so a
+  # body that survived jq would have died at curl instead. It goes through a
+  # file. mktemp creates it 0600 and the trap removes it, which also matters
+  # because that file holds the person's code.
+  local body_file hdr_file req_file
+  body_file="$(mktemp)"; hdr_file="$(mktemp)"; req_file="$(mktemp)"
+  trap 'rm -f "$body_file" "$hdr_file" "$req_file"' RETURN
+  printf '%s' "$payload" > "$req_file"
 
   local meta_out http_code
   meta_out="$(curl -sS -o "$body_file" -D "$hdr_file" -w '%{http_code} %{time_total} %{content_type}' \
     -X POST "$AI4DEV_GATEWAY_URL/chat/completions" \
     -H "Authorization: Bearer $key" \
     -H "Content-Type: application/json" \
-    -d "$payload")" || die "could not reach the gateway. Run 'ai4dev doctor'."
+    --data-binary "@$req_file")" || die "could not reach the gateway. Run 'ai4dev doctor'."
 
   local ctype reason
   read -r http_code LAST_LATENCY ctype <<< "$meta_out"
@@ -831,8 +849,27 @@ cmd_commit() {
   [[ -f "$template" ]] || die "no commit prompt at $template"
 
   local branch; branch="$(git rev-parse --abbrev-ref HEAD)"
+
+  # Fixing the ARG_MAX crash makes an enormous diff POSSIBLE to send. It does
+  # not make it a good idea: nobody writes a better commit message from forty
+  # thousand lines, the model may not even accept them, and you pay for every
+  # one. Past the threshold, send the file-level summary plus the head of the
+  # patch, and say so out loud rather than quietly sending less than the person
+  # thinks they sent.
+  local staged_lines diff_text
+  staged_lines="$(git diff --staged | wc -l | tr -d ' ')"
+  if [[ "$staged_lines" -gt "$COMMIT_DIFF_MAX_LINES" ]]; then
+    warn "staged diff is $staged_lines lines — sending the summary and the first $COMMIT_DIFF_MAX_LINES"
+    info "if the message comes out vague, stage less and commit in pieces"
+    diff_text="$(printf '%s\n\n--- %s lines staged in total; the first %s follow ---\n\n%s\n' \
+      "$(git diff --staged --stat)" "$staged_lines" "$COMMIT_DIFF_MAX_LINES" \
+      "$(git diff --staged | head -n "$COMMIT_DIFF_MAX_LINES")")"
+  else
+    diff_text="$(git diff --staged)"
+  fi
+
   local msg;    msg="$(call committer \
-                        "$(render "$template" DIFF "$(git diff --staged)" BRANCH "$branch")" \
+                        "$(render "$template" DIFF "$diff_text" BRANCH "$branch")" \
                         "task=commit,branch=$branch")"
 
   printf '\n%s%s%s\n\n' "$B" "$msg" "$N"
