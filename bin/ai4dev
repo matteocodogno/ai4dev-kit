@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.25.3"
+readonly AI4DEV_VERSION="1.25.4"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -2213,7 +2213,37 @@ cmd_agent() {
 
       opencode_v2_unverified "where 'agent create --path' writes the file"
       export AI4DEV_API_KEY="$key"
-      exec opencode agent create ${args[@]+"${args[@]}"}
+
+      local oc_major; oc_major="$(opencode_major 2>/dev/null || true)"
+      [[ -n "$oc_major" ]] || oc_major=1
+      if [[ "$oc_major" == "1" ]]; then
+        exec opencode agent create ${args[@]+"${args[@]}"}
+      fi
+
+      # v2 answers `agent list` with "Unexpected positional argument: list", so
+      # the `agent <verb>` shape is gone — and `agent create` opens with the
+      # same two tokens. Try the plural once, as `agent list` does, then stop
+      # with something the person can act on. Unlike `list`, there is no
+      # fallback here: generating an agent needs the model, and reading files
+      # cannot substitute for that.
+      warn "opencode $oc_major: the generator is only measured on $OPENCODE_PINNED" >&2
+      if opencode agents create ${args[@]+"${args[@]}"}; then exit 0; fi
+      printf '\n'
+      bad "the agent generator does not run on opencode $(opencode_version 2>/dev/null || echo "$oc_major.x")"
+      info "Two ways forward, and the first one is the lesson of this module anyway:"
+      info ""
+      info "  1. write the file yourself — an agent IS a file. In $AI4DEV_KIT/agents/<name>.md:"
+      info "       ---"
+      info "       description: what it does, and when to reach for it"
+      info "       mode: subagent"
+      info "       tools:"
+      info "         read: true"
+      info "         edit: false"
+      info "       ---"
+      info "       then the prompt, in prose."
+      info ""
+      info "  2. match the rest of the room:  $OPENCODE_INSTALL_HINT"
+      exit 1
       ;;
     *)
       printf 'usage: ai4dev agent create [--mode primary|subagent|all] [--permissions "read,grep,..."]\n'
