@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.26.0"
+readonly AI4DEV_VERSION="1.26.1"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -994,6 +994,37 @@ opencode_v2_unverified() {
   info "if it lands in the wrong place or is ignored, that is the reason" >&2
 }
 
+# v2 has NO -m / --model flag on the root command. Measured from the error a
+# participant hit: "Unrecognized flag: -m in command opencode". Its root flags
+# are --standalone --server --auto --continue --session --prompt and nothing
+# else, so every `opencode -m <x>` this CLI emits dies at the parser.
+#
+# The durable way to choose a model there is the config's own `model` key —
+# which is also what v1 reads when no flag is given, so it is not a v2 hack. It
+# persists, unlike a flag, so the caller says so out loud.
+opencode_set_model() {
+  local id="$1" tmp
+  [[ -f "$OPENCODE_CONFIG_FILE" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  tmp="$OPENCODE_CONFIG_FILE.tmp.$$"
+  jq --arg m "$id" '.model = $m' "$OPENCODE_CONFIG_FILE" > "$tmp" 2>/dev/null \
+    || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$OPENCODE_CONFIG_FILE"
+}
+
+# Drops a -m/--model pair out of an argv. Echoes the survivors, one per line.
+opencode_strip_model_flag() {
+  local x skip=0
+  for x in "$@"; do
+    if [[ "$skip" -eq 1 ]]; then skip=0; continue; fi
+    case "$x" in
+      -m|--model)       skip=1; continue ;;
+      -m=*|--model=*)   continue ;;
+      *) printf '%s\n' "$x" ;;
+    esac
+  done
+}
+
 opencode_version() {
   command -v opencode >/dev/null 2>&1 || return 1
   opencode --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
@@ -1168,7 +1199,22 @@ cmd_code() {
       *) args+=("$a") ;;
     esac
   done
-  [[ -n "$qualified" ]] && info "model: ai4dev/$qualified" >&2
+  local oc_major; oc_major="$(opencode_major 2>/dev/null || true)"
+  [[ -n "$oc_major" ]] || oc_major=1
+  if [[ -n "$qualified" && "$oc_major" != "1" ]]; then
+    local kept=() line
+    while IFS= read -r line; do [[ -n "$line" ]] && kept+=("$line"); done \
+      < <(opencode_strip_model_flag ${args[@]+"${args[@]}"})
+    args=(${kept[@]+"${kept[@]}"})
+    if opencode_set_model "ai4dev/$qualified"; then
+      info "model: ai4dev/$qualified — set in your OpenCode config, because v$oc_major has no -m flag" >&2
+      info "  it stays until you change it: 'ai4dev code -m <alias>' again, or edit $OPENCODE_CONFIG_FILE" >&2
+    else
+      warn "could not set the model in the config — OpenCode will use its own default" >&2
+    fi
+  elif [[ -n "$qualified" ]]; then
+    info "model: ai4dev/$qualified" >&2
+  fi
 
   # The key enters the environment of this process, which is about to be
   # replaced by OpenCode. No shell survives this line holding it.
@@ -1417,7 +1463,18 @@ cmd_local() {
 
       info "model: ollama/$LOCAL_MODEL_NAME  at  $url" >&2
       info "no key, no gateway, no trace in Langfuse. Your code stays here." >&2
-      exec opencode -m "ollama/$LOCAL_MODEL_NAME" ${1+"$@"}
+
+      # Same v2 limitation as `ai4dev code`: no -m at the root. Here it bit
+      # harder, because this command ALWAYS passed one.
+      local oc_major; oc_major="$(opencode_major 2>/dev/null || true)"
+      [[ -n "$oc_major" ]] || oc_major=1
+      if [[ "$oc_major" == "1" ]]; then
+        exec opencode -m "ollama/$LOCAL_MODEL_NAME" ${1+"$@"}
+      fi
+      opencode_set_model "ollama/$LOCAL_MODEL_NAME" \
+        || die "could not point OpenCode at the local model (v$oc_major has no -m flag, so the config is the only way)"
+      info "  set in your OpenCode config: v$oc_major has no -m flag, and it stays until you change it" >&2
+      exec opencode ${1+"$@"}
       ;;
   esac
 }
@@ -3002,7 +3059,26 @@ cmd_mcp() {
       # `opencode mcp list` cannot work. This one can, because it exports it.
       local gh_token; gh_token="$(github_token_resolve)"
       [[ -n "$gh_token" ]] && export AI4DEV_GITHUB_TOKEN="$gh_token"
-      exec opencode mcp list
+      # Not exec'd, for the reason `agent list` is not: `mcp` survives into v2
+      # as a subcommand but its verbs are unverified, and `agent list` already
+      # taught us what an unverified verb looks like. The config is the honest
+      # fallback — it is what OpenCode reads anyway.
+      if opencode mcp list; then exit 0; fi
+      printf '\n'
+      warn "'opencode mcp list' failed (opencode $(opencode_version 2>/dev/null || echo '?'))"
+      info "reading your config instead — these are the servers OpenCode is configured with:"
+      printf '\n'
+      if [[ -f "$OPENCODE_CONFIG_FILE" ]]; then
+        jq -r '(.mcp // {}) | to_entries[]
+               | "  \(.key)\t\(.value.type // "?")\tenabled=\(.value.enabled // true)"' \
+          "$OPENCODE_CONFIG_FILE" 2>/dev/null | column -t -s "$(printf '\t')" 2>/dev/null \
+          || jq -r '(.mcp // {}) | keys[] | "  " + .' "$OPENCODE_CONFIG_FILE" 2>/dev/null \
+          || info "  (none configured)"
+      else
+        info "  no OpenCode config yet"
+      fi
+      printf '\n'
+      info "whether each one actually CONNECTS is something only OpenCode can tell you"
       ;;
     remove)
       local name="${1:-}"; [[ -n "$name" ]] || die "usage: ai4dev mcp remove <name>"
