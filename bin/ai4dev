@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.25.4"
+readonly AI4DEV_VERSION="1.25.5"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -2129,6 +2129,19 @@ cmd_agent() {
   command -v opencode >/dev/null 2>&1 \
     || die "opencode not found. Install it with:  $OPENCODE_INSTALL_HINT"
 
+  # MEASURED on 2.0.20, from `opencode --help`: v2 has no `agent` subcommand at
+  # all. Its subcommands are upgrade, uninstall, acp, api, debug, auth, mcp,
+  # plugin, models, stats, mini, run, session, service, reload, pair, serve.
+  #
+  # That explains both error shapes we saw. `opencode agent list` is parsed as
+  # "directory = agent" plus a stray positional "list"; `agent create --mode …`
+  # is the same plus flags the root command does not have. There is no plural
+  # to try either — `agents` is not a subcommand in that list — so the earlier
+  # probe could never have worked, and all it achieved was printing v2's entire
+  # help over the top of the real message.
+  local oc_major; oc_major="$(opencode_major 2>/dev/null || true)"
+  [[ -n "$oc_major" ]] || oc_major=1
+
   case "$sub" in
     list)
       # No model is called here, so no key is needed. It is in this command so
@@ -2140,28 +2153,43 @@ cmd_agent() {
       # meant the person got whatever OpenCode printed and nothing else. Run it,
       # and when it fails fall back to reading the files — which is version
       # proof, because an agent is a file.
-      # Two spellings, then the files. v2 answers `agent list` with
-      # "Unexpected positional argument: list" — so the noun is accepted and the
-      # verb is not, which is what a rename looks like. The plural matches how
-      # v2 renamed the directories (agent -> agents), so it is worth one try.
-      #
-      # Only non-interactive forms are attempted. A bare `opencode agent` might
-      # open a picker, and a command that hangs in front of a room is worse than
-      # one that fails.
-      local form
-      for form in "agent list" "agents list"; do
-        # shellcheck disable=SC2086
-        if opencode $form 2>/dev/null; then return 0; fi
-      done
+      if [[ "$oc_major" == "1" ]]; then
+        if opencode agent list; then return 0; fi
+        printf '\n'
+        warn "'opencode agent list' failed (opencode $(opencode_version 2>/dev/null || echo '?'))"
+      else
+        info "opencode $oc_major has no 'agent' subcommand, so this reads the files directly"
+      fi
       printf '\n'
-      warn "opencode could not list agents here (opencode $(opencode_version 2>/dev/null || echo 'version unknown'))"
-      info "reading the agent files directly instead — this is what OpenCode would load:"
+      info "this is what OpenCode will load:"
       printf '\n'
       agent_list_files
       printf '\n'
       info "built-in agents and resolved permissions are not shown: only OpenCode knows those"
       ;;
     create)
+      # Checked before anything else: no key is fetched, no token warning is
+      # printed, and OpenCode is never handed a command it cannot parse. The
+      # person gets one message instead of v2's help text followed by one.
+      if [[ "$oc_major" != "1" ]]; then
+        bad "opencode $(opencode_version 2>/dev/null || echo "$oc_major.x") has no agent generator"
+        info "v2 dropped the 'agent' subcommand entirely — there is nothing to call."
+        info ""
+        info "Two ways forward, and the first one is the lesson of this module anyway:"
+        info ""
+        info "  1. write the file yourself — an agent IS a file. In $AI4DEV_KIT/agents/<name>.md:"
+        info "       ---"
+        info "       description: what it does, and when to reach for it"
+        info "       mode: subagent"
+        info "       tools:"
+        info "         read: true"
+        info "         edit: false"
+        info "       ---"
+        info "       then the prompt, in prose."
+        info ""
+        info "  2. match the rest of the room:  $OPENCODE_INSTALL_HINT"
+        exit 1
+      fi
       require_gateway
       local key
       key="$(fetch_key)" || die \
@@ -2214,36 +2242,7 @@ cmd_agent() {
       opencode_v2_unverified "where 'agent create --path' writes the file"
       export AI4DEV_API_KEY="$key"
 
-      local oc_major; oc_major="$(opencode_major 2>/dev/null || true)"
-      [[ -n "$oc_major" ]] || oc_major=1
-      if [[ "$oc_major" == "1" ]]; then
-        exec opencode agent create ${args[@]+"${args[@]}"}
-      fi
-
-      # v2 answers `agent list` with "Unexpected positional argument: list", so
-      # the `agent <verb>` shape is gone — and `agent create` opens with the
-      # same two tokens. Try the plural once, as `agent list` does, then stop
-      # with something the person can act on. Unlike `list`, there is no
-      # fallback here: generating an agent needs the model, and reading files
-      # cannot substitute for that.
-      warn "opencode $oc_major: the generator is only measured on $OPENCODE_PINNED" >&2
-      if opencode agents create ${args[@]+"${args[@]}"}; then exit 0; fi
-      printf '\n'
-      bad "the agent generator does not run on opencode $(opencode_version 2>/dev/null || echo "$oc_major.x")"
-      info "Two ways forward, and the first one is the lesson of this module anyway:"
-      info ""
-      info "  1. write the file yourself — an agent IS a file. In $AI4DEV_KIT/agents/<name>.md:"
-      info "       ---"
-      info "       description: what it does, and when to reach for it"
-      info "       mode: subagent"
-      info "       tools:"
-      info "         read: true"
-      info "         edit: false"
-      info "       ---"
-      info "       then the prompt, in prose."
-      info ""
-      info "  2. match the rest of the room:  $OPENCODE_INSTALL_HINT"
-      exit 1
+      exec opencode agent create ${args[@]+"${args[@]}"}
       ;;
     *)
       printf 'usage: ai4dev agent create [--mode primary|subagent|all] [--permissions "read,grep,..."]\n'
