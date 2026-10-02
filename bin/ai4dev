@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.25.5"
+readonly AI4DEV_VERSION="1.26.0"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -2116,6 +2116,105 @@ agent_list_files() {
   fi
 }
 
+# Every tool name OpenCode accepts, measured from 1.18.x `agent create --help`.
+#
+# The completeness of this list is the whole point. The default is `*: allow`,
+# so a tools block that names only what you want ENABLED leaves every other tool
+# switched on — a file that reads as locked down and is not. So --permissions is
+# written as an allow-list AND a deny-list, here, deterministically. The model
+# writes the prose; it does not get a vote on what the agent may touch.
+readonly AGENT_TOOLS=(bash read edit glob grep webfetch task todowrite websearch lsp skill)
+
+agent_slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9]\{1,\}/-/g; s/^-//; s/-$//' | cut -c1-40
+}
+
+# agent_create_v2 <model-alias> <description> <mode> <permissions-csv> <dir>
+#
+# OpenCode v2 has no `agent` subcommand, so there is nothing to hand the job to.
+# This does it: one model call through the gateway for the prompt text, and the
+# file is assembled and written here. The person types the same command they
+# always typed.
+#
+# It is not merely a port of the v1 path, it is a better one. v1 lets the model
+# invent the whole file, including the permissions; here the model writes only
+# the prose and the CLI writes the frontmatter from the flags that were actually
+# passed. And --path means the directory, with nothing appended behind your back.
+agent_create_v2() {
+  local model="$1" desc="$2" mode="$3" perms="$4" dir="$5"
+  [[ -n "$desc" ]] || die "--description is required: it is what the model is told to build"
+  perms="$(printf '%s' "$perms" | tr -d '[:space:]')"
+  mkdir -p "$dir" || die "cannot create $dir"
+
+  info "model: $model  (through the gateway: opencode $oc_major has no generator to call)" >&2
+  warn "this spends tokens: a model writes the prompt, it does not template it" >&2
+
+  local prompt reply
+  prompt="$(cat <<EOF
+You are writing the system prompt for a single-purpose coding agent.
+
+What the agent must do:
+$desc
+
+Answer with exactly this shape and nothing else:
+
+name: <short-kebab-case-identifier>
+
+<the system prompt itself>
+
+Rules for the prompt you write: address the agent in the second person. Be
+concrete about what it reads, what it reports, and what it must refuse to do.
+No markdown fences, no front matter, no heading announcing what you are doing.
+Under 200 words.
+EOF
+)"
+  reply="$(call "$model" "$prompt" "task=agent_create")" \
+    || die "the model call failed. Run 'ai4dev doctor'."
+  [[ -n "$reply" ]] || die "the model returned nothing"
+
+  # A fence anyway is the likeliest way a model ignores "no fences".
+  reply="$(printf '%s\n' "$reply" | sed '/^```/d')"
+
+  local name body
+  name="$(printf '%s\n' "$reply" | awk -F': *' '/^name: */ {print $2; exit}')"
+  body="$(printf '%s\n' "$reply" | awk 'f {print} /^name: */ {f=1}' | sed '/./,$!d')"
+  [[ -n "$name" ]] || name="$(agent_slug "$desc")"
+  name="$(agent_slug "$name")"
+  [[ -n "$name" ]] || name="agent"
+  [[ -n "$body" ]] || body="$reply"
+
+  local file="$dir/$name.md"
+  if [[ -e "$file" ]]; then
+    die "$file already exists. Delete it, or describe a different agent."
+  fi
+
+  local t allowed
+  {
+    printf -- '---\n'
+    printf 'description: %s\n' "$desc"
+    printf 'mode: %s\n' "${mode:-all}"
+    if [[ -n "$perms" ]]; then
+      printf 'tools:\n'
+      for t in "${AGENT_TOOLS[@]}"; do
+        if printf '%s' ",$perms," | grep -q ",$t,"; then allowed=true; else allowed=false; fi
+        printf '  %s: %s\n' "$t" "$allowed"
+      done
+    fi
+    printf -- '---\n\n'
+    printf '%s\n' "$body"
+  } > "$file" || die "could not write $file"
+
+  ok "wrote $file"
+  if [[ -n "$perms" ]]; then
+    info "tools: $perms allowed, every other tool written out as false"
+    info "  omitting a tool does NOT deny it — the default is allow — so they are all listed"
+  else
+    warn "no --permissions given, so this agent may use every tool"
+  fi
+  info "check it with:  ai4dev agent list"
+}
+
 cmd_agent() {
   # `opencode agent create` asks a MODEL to write the agent file, so it needs the
   # gateway key — and a bare `opencode` never gets one. The OpenCode config
@@ -2168,42 +2267,30 @@ cmd_agent() {
       info "built-in agents and resolved permissions are not shown: only OpenCode knows those"
       ;;
     create)
-      # Checked before anything else: no key is fetched, no token warning is
-      # printed, and OpenCode is never handed a command it cannot parse. The
-      # person gets one message instead of v2's help text followed by one.
-      if [[ "$oc_major" != "1" ]]; then
-        bad "opencode $(opencode_version 2>/dev/null || echo "$oc_major.x") has no agent generator"
-        info "v2 dropped the 'agent' subcommand entirely — there is nothing to call."
-        info ""
-        info "Two ways forward, and the first one is the lesson of this module anyway:"
-        info ""
-        info "  1. write the file yourself — an agent IS a file. In $AI4DEV_KIT/agents/<name>.md:"
-        info "       ---"
-        info "       description: what it does, and when to reach for it"
-        info "       mode: subagent"
-        info "       tools:"
-        info "         read: true"
-        info "         edit: false"
-        info "       ---"
-        info "       then the prompt, in prose."
-        info ""
-        info "  2. match the rest of the room:  $OPENCODE_INSTALL_HINT"
-        exit 1
-      fi
       require_gateway
       local key
       key="$(fetch_key)" || die \
         "no virtual key yet, and 'agent create' asks a model to write the file. Paste the one from your Slack DM into $CONFIG_FILE, then try again."
 
-      # Two defaults, so that the command in the room is short enough to type
-      # without a mistake: the kit's agents directory, and a model alias
-      # qualified the way `ai4dev code` qualifies it.
+      # Parsed into BOTH shapes: an argv for OpenCode's own generator on v1, and
+      # plain values for the v2 path, which has no generator to hand them to.
       local a args=() has_path=0 has_model=0 qualified=""
+      local v_mode="" v_perms="" v_desc="" v_path=""
       while [[ $# -gt 0 ]]; do
         a="$1"; shift
         case "$a" in
-          --path) has_path=1; args+=("$a"); [[ $# -gt 0 ]] && { args+=("$1"); shift; } ;;
-          --path=*) has_path=1; args+=("$a") ;;
+          --path) has_path=1; args+=("$a")
+            if [[ $# -gt 0 ]]; then v_path="$1"; args+=("$1"); shift; fi ;;
+          --path=*) has_path=1; v_path="${a#*=}"; args+=("$a") ;;
+          --mode) args+=("$a")
+            if [[ $# -gt 0 ]]; then v_mode="$1"; args+=("$1"); shift; fi ;;
+          --mode=*) v_mode="${a#*=}"; args+=("$a") ;;
+          --permissions|--tools) args+=("$a")
+            if [[ $# -gt 0 ]]; then v_perms="$1"; args+=("$1"); shift; fi ;;
+          --permissions=*|--tools=*) v_perms="${a#*=}"; args+=("$a") ;;
+          --description) args+=("$a")
+            if [[ $# -gt 0 ]]; then v_desc="$1"; args+=("$1"); shift; fi ;;
+          --description=*) v_desc="${a#*=}"; args+=("$a") ;;
           -m|--model)
             has_model=1; args+=("$a")
             if [[ $# -gt 0 ]]; then
@@ -2218,6 +2305,17 @@ cmd_agent() {
           *) args+=("$a") ;;
         esac
       done
+      [[ -n "$qualified" ]] || qualified="$AI4DEV_OPENCODE_MODEL"
+
+      # v2 has no `agent` subcommand to call, so this CLI does the whole job
+      # itself: one model call through the gateway, and it writes the file. From
+      # the outside the command is the same command.
+      if [[ "$oc_major" != "1" ]]; then
+        agent_create_v2 "$qualified" "$v_desc" "$v_mode" "$v_perms" \
+                        "${v_path:-$AI4DEV_KIT/agents}"
+        return 0
+      fi
+
       # OpenCode's --path is NOT the directory the file lands in. Measured in the
       # 1.18.x binary: it does join(path, "agents") and writes
       # <path>/agents/<identifier>.md. Its own --help says "directory path to
@@ -2232,16 +2330,11 @@ cmd_agent() {
       else
         warn "you passed --path: OpenCode appends 'agents' to it, so the file lands in <your path>/agents/" >&2
       fi
-      if [[ "$has_model" -eq 0 ]]; then
-        args+=(-m "ai4dev/$AI4DEV_OPENCODE_MODEL")
-        qualified="$AI4DEV_OPENCODE_MODEL"
-      fi
-      [[ -n "$qualified" ]] && info "model: ai4dev/$qualified" >&2
+      if [[ "$has_model" -eq 0 ]]; then args+=(-m "ai4dev/$AI4DEV_OPENCODE_MODEL"); fi
+      info "model: ai4dev/$qualified" >&2
       warn "this spends tokens: a model writes the file, it does not template it" >&2
-
       opencode_v2_unverified "where 'agent create --path' writes the file"
       export AI4DEV_API_KEY="$key"
-
       exec opencode agent create ${args[@]+"${args[@]}"}
       ;;
     *)
