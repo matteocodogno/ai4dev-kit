@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.24.0"
+readonly AI4DEV_VERSION="1.25.0"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -1383,6 +1383,109 @@ cmd_local() {
       exec opencode -m "ollama/$LOCAL_MODEL_NAME" ${1+"$@"}
       ;;
   esac
+}
+
+# ─── sync: take a named piece of the course into the repo you are standing in ─
+#
+# This exists because the alternative is dictating a two-hundred-character git
+# line to ten people at once. All ten type it, one mistypes it, and the next
+# five minutes go on their terminal instead of the lesson.
+#
+# It is deliberately NOT a merge or a cherry-pick: it reads paths out of a
+# commit and writes them down. It therefore cannot conflict, and running it
+# twice changes nothing the second time.
+
+readonly SYNC_MARK_BEGIN='<!-- ai4dev:cc-sdd:begin -->'
+
+sync_agents_block() {
+  # <ref> → append the course's cc-sdd block to AGENTS.md, exactly once.
+  #
+  # Checking the whole file out would overwrite whatever the person has written
+  # in their own AGENTS.md — in a course about steering a model, the worst file
+  # in the repository to clobber. The block is delimited at both ends, so take
+  # only that, and only when it is not already there.
+  local ref="$1" block
+  if [[ -f AGENTS.md ]] && grep -qF "$SYNC_MARK_BEGIN" AGENTS.md; then
+    info "AGENTS.md: the cc-sdd block is already there, left alone"
+    return 1
+  fi
+  block="$(git show "$ref:AGENTS.md" 2>/dev/null \
+    | awk '/ai4dev:cc-sdd:begin/{f=1} f{print} /ai4dev:cc-sdd:end/{if(f) exit}')"
+  [[ -n "$block" ]] || { warn "AGENTS.md: no cc-sdd block in $ref, skipping it"; return 1; }
+  printf '\n%s\n' "$block" >> AGENTS.md
+  ok "AGENTS.md: cc-sdd block appended — everything you wrote is still there"
+  return 0
+}
+
+cmd_sync() {
+  load_config
+
+  local what="${1:-}" ref label
+  local paths=()
+  case "$what" in
+    kiro)
+      # A sha, not a tag, because there is no tag on it. Overridable so this
+      # does not have to be re-released when the course moves it.
+      ref="${AI4DEV_SYNC_KIRO_REF:-e0c7444}"
+      paths=(.kiro .opencode/command)
+      label="the Kiro steering documents and the /kiro-* commands"
+      ;;
+    -h|--help|"")
+      printf 'usage: ai4dev sync <what>\n\n'
+      info "kiro    the Kiro steering documents and the /kiro-* commands"
+      printf '\n'
+      info "Takes those paths out of the course repository and puts them on the"
+      info "branch you are standing on. Not a merge: it cannot conflict, and"
+      info "running it twice does nothing the second time."
+      [[ -n "$what" ]] && return 0
+      exit 2 ;;
+    *) die "unknown: $what — the only one so far is 'kiro'" ;;
+  esac
+
+  local repo inferred
+  if inferred="$(module_repo_from_cwd)"; then repo="$inferred"
+  else repo="$(module_repo tinder4dogs)"; fi
+  cd "$repo" || die "cannot enter $repo"
+  info "repository: $repo"
+
+  local remote; remote="$(module_remote)"
+  git fetch --quiet --tags --force "$remote" 2>/dev/null \
+    || warn "could not reach $remote — working with the history you already have"
+  git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null \
+    || die "$ref is not in this repository. Check your network, then try again."
+
+  # Only the paths this command is about to write. Someone mid-exercise has
+  # changes all over the place and none of them are our business.
+  local pth; local dirty=()
+  for pth in "${paths[@]}" AGENTS.md; do
+    [[ -e "$pth" ]] || continue
+    git diff --quiet -- "$pth" 2>/dev/null || dirty+=("$pth")
+  done
+  if [[ ${#dirty[@]} -gt 0 ]]; then
+    bad "you have uncommitted changes in: ${dirty[*]}"
+    info "this would overwrite them. Commit or stash those first."
+    exit 1
+  fi
+
+  git checkout "$ref" -- "${paths[@]}" || die "could not take those paths out of $ref"
+  git add -- "${paths[@]}"
+
+  local commit_paths=("${paths[@]}")
+  if sync_agents_block "$ref"; then
+    git add -- AGENTS.md
+    commit_paths+=(AGENTS.md)
+  fi
+
+  if git diff --cached --quiet; then
+    ok "already in sync — nothing to do"
+    return 0
+  fi
+
+  git commit --quiet -m "chore: $what from the course ($ref)" -- "${commit_paths[@]}" \
+    || die "could not commit. Is your git identity set?  git config --global user.email \"you@example.com\""
+
+  ok "$label are on $(git rev-parse --abbrev-ref HEAD)"
+  info "check it with:  ls .kiro/steering"
 }
 
 cmd_costs() {
@@ -2855,6 +2958,7 @@ main() {
     ask)     shift; cmd_ask     "$@" ;;
     code)    shift; cmd_code    "$@" ;;
     local)   shift; cmd_local   "$@" ;;
+    sync)    shift; cmd_sync    "$@" ;;
     review)  shift; cmd_review  "$@" ;;
     commit)  shift; cmd_commit  "$@" ;;
     costs)   shift; cmd_costs   "$@" ;;
