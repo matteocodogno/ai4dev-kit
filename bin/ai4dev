@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.25.2"
+readonly AI4DEV_VERSION="1.25.3"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -2140,9 +2140,21 @@ cmd_agent() {
       # meant the person got whatever OpenCode printed and nothing else. Run it,
       # and when it fails fall back to reading the files — which is version
       # proof, because an agent is a file.
-      if opencode agent list; then return 0; fi
+      # Two spellings, then the files. v2 answers `agent list` with
+      # "Unexpected positional argument: list" — so the noun is accepted and the
+      # verb is not, which is what a rename looks like. The plural matches how
+      # v2 renamed the directories (agent -> agents), so it is worth one try.
+      #
+      # Only non-interactive forms are attempted. A bare `opencode agent` might
+      # open a picker, and a command that hangs in front of a room is worse than
+      # one that fails.
+      local form
+      for form in "agent list" "agents list"; do
+        # shellcheck disable=SC2086
+        if opencode $form 2>/dev/null; then return 0; fi
+      done
       printf '\n'
-      warn "'opencode agent list' failed here (opencode $(opencode_version 2>/dev/null || echo 'version unknown'))"
+      warn "opencode could not list agents here (opencode $(opencode_version 2>/dev/null || echo 'version unknown'))"
       info "reading the agent files directly instead — this is what OpenCode would load:"
       printf '\n'
       agent_list_files
