@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.25.1"
+readonly AI4DEV_VERSION="1.25.2"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -2075,6 +2075,47 @@ module_require_clean() {
   exit 1
 }
 
+# Every directory OpenCode is known to read agent files from, in both
+# spellings. v1 globs {agent,agents}/**/*.md — measured — and v2 prefers the
+# plural. Listing all of them is cheap and costs nothing when one is absent.
+agent_dirs() {
+  printf '%s\n' \
+    "$AI4DEV_KIT/agents" \
+    "$HOME/.config/opencode/agent" \
+    "$HOME/.config/opencode/agents" \
+    "$PWD/.opencode/agent" \
+    "$PWD/.opencode/agents"
+}
+
+# Reads the files instead of asking OpenCode. It therefore cannot be broken by
+# a CLI surface that changes between major versions, and it answers the
+# question participants actually ask, which is not "what agents exist" but
+# "WHERE is the file I just created".
+#
+# What it cannot show is what only OpenCode knows: the built-in agents, and the
+# permissions it resolved. So it is the fallback, not the first choice.
+agent_list_files() {
+  local dir f name mode seen=0
+  while IFS= read -r dir; do
+    [[ -d "$dir" ]] || continue
+    while IFS= read -r f; do
+      [[ -f "$f" ]] || continue
+      # `name:` in the frontmatter overrides the filename — measured on 1.18.x,
+      # and a file whose name does not match its agent is a real source of
+      # confusion, so show what OpenCode would actually register.
+      name="$(awk -F': *' '/^name: */ {print $2; exit}' "$f" 2>/dev/null)"
+      [[ -n "$name" ]] || { name="$(basename "$f")"; name="${name%.md}"; }
+      mode="$(awk -F': *' '/^mode: */ {print $2; exit}' "$f" 2>/dev/null)"
+      printf '  %-28s %-10s %s\n' "$name" "${mode:-all}" "$f"
+      seen=$((seen+1))
+    done < <(find "$dir" -type f -name '*.md' 2>/dev/null | sort)
+  done < <(agent_dirs)
+  if [[ "$seen" -eq 0 ]]; then
+    info "no agent files found in any of:"
+    agent_dirs | sed 's/^/    /'
+  fi
+}
+
 cmd_agent() {
   # `opencode agent create` asks a MODEL to write the agent file, so it needs the
   # gateway key — and a bare `opencode` never gets one. The OpenCode config
@@ -2093,7 +2134,20 @@ cmd_agent() {
       # No model is called here, so no key is needed. It is in this command so
       # that "which agents do I have" is one habit and not two tools, and
       # because its exit code is the check that catches a broken agent file.
-      exec opencode agent list
+      #
+      # Not exec'd any more: OpenCode has to be allowed to fail. `opencode agent
+      # list` does not work on every major version, and handing the process over
+      # meant the person got whatever OpenCode printed and nothing else. Run it,
+      # and when it fails fall back to reading the files — which is version
+      # proof, because an agent is a file.
+      if opencode agent list; then return 0; fi
+      printf '\n'
+      warn "'opencode agent list' failed here (opencode $(opencode_version 2>/dev/null || echo 'version unknown'))"
+      info "reading the agent files directly instead — this is what OpenCode would load:"
+      printf '\n'
+      agent_list_files
+      printf '\n'
+      info "built-in agents and resolved permissions are not shown: only OpenCode knows those"
       ;;
     create)
       require_gateway
