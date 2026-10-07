@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.27.0"
+readonly AI4DEV_VERSION="1.28.0"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -2141,6 +2141,40 @@ module_baseline_files() {
   fi
 }
 
+module_after_start_hints() {
+  # What `start` cannot do for you, said once, at the only moment it is useful.
+  #
+  # This is DETECTED and not a table of module numbers, on purpose: a table goes
+  # stale the first time a module moves, and nobody notices until a room of
+  # twenty is typing a command that was right last quarter.
+  #
+  # From the module that introduces the web interface onwards, `start` puts a
+  # package.json in the tree that nobody has installed. The first thing the
+  # participant types is `npm run dev`, in a directory with no node_modules,
+  # and the error names vite rather than the thing that is actually missing.
+  if [[ -f web/package.json ]]; then
+    printf '\n'
+    if [[ -d web/node_modules ]]; then
+      info "the web interface is in web/ —  cd web && npm run dev"
+    else
+      warn "the web interface in web/ has no dependencies installed yet"
+      info "  cd web && npm ci && npm run dev"
+    fi
+    info "it expects this application on http://localhost:8080"
+  fi
+
+  # And from the module where the PRODUCT starts calling a model, the product
+  # reads the gateway from its own environment rather than from your kit
+  # config, because a product does not get to read your personal files. No key
+  # is printed here, or anywhere else.
+  if grep -qs 'openai:' src/main/resources/application.yaml; then
+    printf '\n'
+    info "this application calls the gateway from its environment:"
+    info "  AI4DEV_GATEWAY_BASE_URL and AI4DEV_API_KEY"
+    info "unset, it still starts, and /api/ai/health tells you what is missing"
+  fi
+}
+
 module_number() {
   # accepts 4, 04, m4, module-04
   local raw="${1:-}"
@@ -2576,6 +2610,7 @@ cmd_module() {
         info "taken from the tag:  ${files[*]}"
         info "kept:                everything else you had on $from"
         info "the tag itself:      $tag"
+        module_after_start_hints
         return 0
       fi
 
@@ -2585,6 +2620,7 @@ cmd_module() {
       info "the tag itself: $tag"
       info "commit as often as you like — this branch is yours"
       info "when you want to see how it was solved: ai4dev module $shown end"
+      module_after_start_hints
       ;;
     end)
       # Three questions, and they are not the same question:
