@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.26.1"
+readonly AI4DEV_VERSION="1.27.0"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -69,6 +69,12 @@ readonly OPENCODE_CONFIG_FILE="$HOME/.config/opencode/opencode.json"
 readonly COMMIT_DIFF_MAX_LINES="${AI4DEV_COMMIT_DIFF_MAX_LINES:-1500}"
 readonly OPENCODE_PINNED="1.18.33"
 readonly OPENCODE_INSTALL_HINT="npm i -g opencode-ai@$OPENCODE_PINNED"
+
+# The sandbox. Module 11 wraps opencode in an OS-level sandbox -- Landlock on
+# Linux, Seatbelt on macOS -- so that a reviewer's `edit: false` is enforced by
+# something other than the agent that is meant to respect it. Nothing before
+# Module 11 needs it, which is why doctor keeps it yellow.
+readonly NONO_PROFILE="nolabs-ai/opencode"
 
 # The kit is this script's own repository: bin/ai4dev -> repo root.
 KIT_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -688,6 +694,26 @@ cmd_doctor() {
     bad "opencode not found" "$OPENCODE_INSTALL_HINT"
   fi
 
+  # the sandbox -- Module 11 only, so yellow and never red.
+  #
+  # A laptop without nono is not broken: nothing in the first ten modules
+  # touches it. A laptop that reaches Module 11 Part 5 without it cannot do the
+  # exercise, and finding that out there means finding it out twenty minutes
+  # before the end of the afternoon. So it is checked here, every day, from the
+  # start of the course.
+  if command -v nono >/dev/null 2>&1; then
+    local nonov; nonov="$(nono_version 2>/dev/null || true)"
+    ok "nono ${nonov:-present} -- the process sandbox used in Module 11"
+    if is_wsl; then
+      info "  on WSL2 the kernel does not give Landlock per-port network control,"
+      info "  so the sandbox exercise demonstrates a filesystem denial, not a network one"
+    fi
+  else
+    warn "nono not found -- needed by Module 11's sandbox exercise, not before"
+    info "  $(nono_install_hint)"
+    info "  then:  nono run --profile $NONO_PROFILE -- ai4dev code"
+  fi
+
   # kit and workspace
   if [[ -f "$AI4DEV_KIT/prompts/code_review.md" ]]; then ok "kit at $AI4DEV_KIT"
   else bad "kit looks incomplete at $AI4DEV_KIT" "re-clone the kit repository"; fi
@@ -1034,6 +1060,33 @@ opencode_major() {
   local v; v="$(opencode_version)" || return 1
   [[ -n "$v" ]] || return 1
   printf '%s' "${v%%.*}"
+}
+
+# nono is pre-1.0, so the version string is parsed loosely and a version we
+# cannot read is NOT an error: what doctor needs to answer is whether the
+# binary is there. Never ends on the grep -- an unparseable version must not
+# take the whole doctor down under set -e, which is exactly the bug this
+# pattern was written to avoid for opencode.
+nono_version() {
+  command -v nono >/dev/null 2>&1 || return 1
+  local v
+  v="$(nono --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  [[ -n "$v" ]] || return 1
+  printf '%s' "$v"
+}
+
+nono_install_hint() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    printf 'brew install nono'
+  else
+    printf 'curl -fsSL https://nono.sh/install.sh | sh'
+  fi
+}
+
+# True on WSL2, where nono runs but the kernel does not expose everything
+# Landlock can express -- per-port TCP control is missing on 6.6.
+is_wsl() {
+  [[ -r /proc/version ]] && grep -qi microsoft /proc/version 2>/dev/null
 }
 
 sync_opencode_config() {
