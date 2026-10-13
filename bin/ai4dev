@@ -21,6 +21,7 @@
 #   ai4dev costs --last N  the last N requests: tokens, cost, latency, which model
 #   ai4dev key             check that your virtual key is present and usable
 #   ai4dev config          show the resolved configuration
+#   ai4dev db [up|new]     start the product's database on docker or podman
 #   ai4dev module N start  put the repository at the start of module N
 #   ai4dev module N end    show how module N was solved
 #   ai4dev upgrade         update the tool from the course, leaving your work alone
@@ -31,7 +32,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.28.0"
+readonly AI4DEV_VERSION="1.29.0"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -384,6 +385,67 @@ render() {
   printf '%s' "$out"
 }
 
+# ─── containers — the product's database, on whatever runtime is here ────────
+#
+# The course needs exactly one container: the PostgreSQL the product owns. What
+# it does not need is a particular way of starting it. Every container command
+# in this script goes through the functions below, so that nothing here ever
+# names `docker` and then finds out it is not installed.
+#
+# Three measured facts shaped them, and each one is a way to get this wrong:
+#
+#   1. `docker` on PATH proves nothing. The CLI is installed on plenty of
+#      machines where nothing answers on the socket, and Podman Desktop
+#      installs a `docker` shim of its own. The question is whether the runtime
+#      ANSWERS, and `info` is the question that asks it.
+#   2. `podman compose` is not an implementation. It is a thin wrapper that
+#      executes an external provider — docker-compose or podman-compose — and
+#      it fails when neither is installed. So it is tested, never assumed.
+#   3. compose is what the course actually runs. A check that stops at the
+#      runtime passes a laptop that cannot start the database, which is the
+#      worst of the available outcomes: a green doctor and a broken morning.
+
+container_runtime() {
+  # The runtime that answers, by the name its owner calls it. 1 when none does.
+  if docker info >/dev/null 2>&1; then
+    if docker context show 2>/dev/null | grep -qi orb; then printf 'OrbStack'
+    else printf 'docker'; fi
+    return 0
+  fi
+  if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+    printf 'podman'
+    return 0
+  fi
+  return 1
+}
+
+compose_cmd() {
+  # The compose command to run, as words. 1 when there is none, so that the
+  # caller explains it in its own context instead of being told here.
+  if docker info >/dev/null 2>&1; then
+    if docker compose version >/dev/null 2>&1; then printf 'docker compose'; return 0; fi
+    if command -v docker-compose >/dev/null 2>&1; then printf 'docker-compose'; return 0; fi
+  fi
+  if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+    if podman compose version >/dev/null 2>&1; then printf 'podman compose'; return 0; fi
+    if command -v podman-compose >/dev/null 2>&1; then printf 'podman-compose'; return 0; fi
+  fi
+  return 1
+}
+
+compose_hint() {
+  # What to do about it, which is a different sentence for each way it fails.
+  if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+    printf 'podman answers but has no compose provider: brew install docker-compose'
+  elif docker info >/dev/null 2>&1; then
+    printf 'the runtime answers but has no compose: install the Docker Compose plugin'
+  elif command -v podman >/dev/null 2>&1; then
+    printf 'podman is installed and not running: podman machine start'
+  else
+    printf 'start OrbStack or Docker Desktop, or install Podman'
+  fi
+}
+
 # ─── commands ────────────────────────────────────────────────────────────────
 
 # git@github.com:owner  ->  https://github.com/owner
@@ -644,14 +706,22 @@ cmd_doctor() {
   else bad "betterleaks not found" "brew install betterleaks"; fi
 
   # container runtime — for the product's own database only
-  if docker info >/dev/null 2>&1; then
-    local runtime="docker"
-    if docker context show 2>/dev/null | grep -qi orb; then runtime="OrbStack"; fi
-    ok "container runtime reachable ($runtime)"
-  elif command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
-    ok "container runtime reachable (podman)"
+  #
+  # What is checked is COMPOSE and not the runtime, because compose is what
+  # starts the database. A runtime that answers with no compose provider passes
+  # a runtime check and then fails at the first `up`, and `podman compose` is
+  # exactly that case: a wrapper with no implementation of its own.
+  local rt cc_str
+  rt="$(container_runtime || true)"
+  if cc_str="$(compose_cmd)"; then
+    ok "container runtime reachable (${rt:-unknown}, compose via '$cc_str')"
+    if [[ "$cc_str" != "docker compose" ]]; then
+      info "  the product's mise tasks say 'docker compose', which this laptop"
+      info "  does not have. Start its database with 'ai4dev db' instead."
+    fi
   else
-    bad "no container runtime is running" "start OrbStack, Docker Desktop or Podman. Only needed for the product database."
+    bad "no container runtime with compose is reachable" "$(compose_hint)"
+    info "  only the product's own database needs it"
   fi
 
   # config file — it holds your key, so its permissions are part of the check
@@ -847,6 +917,74 @@ cmd_doctor() {
   else
     printf '%s✗ fix the red lines above%s — ask on Slack, that is what it is for\n' "$R" "$N"; exit 1
   fi
+}
+
+cmd_db() {
+  # The product's own PostgreSQL, started with whatever this laptop has.
+  #
+  # The product's mise tasks say `docker compose`, and that is not a defect to
+  # fix there: the product's toolchain describes the product, and a product
+  # repository does not get to know which course is being taught on it. This
+  # command is the course's answer — same compose file, same container, the
+  # runtime resolved first.
+  load_config
+  local what="${1:-up}"
+  case "$what" in
+    -h|--help)
+      printf 'usage: ai4dev db [up|stop|new|status]\n\n'
+      info "up       start the database (the default)"
+      info "stop     stop it and KEEP its data"
+      info "new      throw its data away and start an empty one"
+      info "status   what is running"
+      printf '\n'
+      info "the same thing as 'mise run db', except that this finds the runtime"
+      info "first: those tasks name docker, and not every laptop here has it"
+      return 0
+      ;;
+    up|stop|new|status) ;;
+    *) die "unknown: $what — one of up, stop, new, status" ;;
+  esac
+
+  local repo inferred
+  if inferred="$(module_repo_from_cwd)"; then repo="$inferred"
+  else repo="$(module_repo tinder4dogs)"; fi
+  [[ -f "$repo/compose.yaml" ]] \
+    || die "no compose.yaml in $repo, so there is no database of its own to start"
+
+  local cc_str
+  if ! cc_str="$(compose_cmd)"; then
+    bad "no container runtime with compose is reachable"
+    info "  $(compose_hint)"
+    exit 1
+  fi
+  local -a cc; read -r -a cc <<<"$cc_str"
+
+  info "repository: $repo"
+  info "compose:    $cc_str"
+  cd "$repo" || die "cannot enter $repo"
+
+  case "$what" in
+    up)
+      "${cc[@]}" up -d || die "$cc_str could not start it"
+      ok "the database is up on localhost:5432"
+      ;;
+    stop)
+      "${cc[@]}" down || die "$cc_str could not stop it"
+      ok "the database is stopped, and its data is still there"
+      ;;
+    new)
+      # The task this mirrors exists because `ai4dev module N start` resets the
+      # CODE and cannot reset the DATABASE: the volume outlives every branch,
+      # and a module baseline then meets a schema it never created.
+      warn "this deletes every row in the product database"
+      "${cc[@]}" down -v || die "$cc_str could not remove the old one"
+      "${cc[@]}" up -d   || die "$cc_str could not start the new one"
+      ok "an empty database is up — the migrations run at the next backend start"
+      ;;
+    status)
+      "${cc[@]}" ps || die "$cc_str could not report"
+      ;;
+  esac
 }
 
 cmd_review() {
@@ -3293,6 +3431,9 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
   ai4dev costs --last N  the last N requests: tokens, cost, latency, which model
   ai4dev key             check that your virtual key is present and usable
   ai4dev config          show the resolved configuration
+  ai4dev db [up|new]     start the product's own PostgreSQL, with the runtime
+                         this laptop actually has: docker, OrbStack or podman.
+                         'mise run db' names docker and fails without it
   ai4dev module N start  put the course repository at the start of module N,
                          on a branch of your own. Refuses if you have
                          uncommitted work rather than throwing it away
@@ -3356,6 +3497,7 @@ main() {
     key)     shift; cmd_key     "$@" ;;
     config)  shift; cmd_config  "$@" ;;
     module)  shift; cmd_module  "$@" ;;
+    db)      shift; cmd_db      "$@" ;;
     agent)   shift; cmd_agent   "$@" ;;
     sdd)     shift; cmd_sdd     "$@" ;;
     skill)   shift; cmd_skill   "$@" ;;
