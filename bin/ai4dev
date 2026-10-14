@@ -32,7 +32,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.30.0"
+readonly AI4DEV_VERSION="1.31.0"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -2341,6 +2341,19 @@ module_number() {
   printf '%02d' "$((10#$raw))"
 }
 
+lab_number() {
+  # accepts 2, lab2, l2. NOT zero padded, because the tags are not: a module is
+  # two digits because it is sorted next to thirty others, and a lab is one
+  # because it is sorted next to six.
+  local raw="${1:-}"
+  raw="${raw#lab}"; raw="${raw#l}"
+  case "$raw" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [[ "$raw" -ge 1 ]] || return 1
+  printf '%d' "$((10#$raw))"
+}
+
 module_remote() {
   # Tags come from the course repository. On a fork that is 'upstream'; on a
   # direct clone origin IS the course repository and there is no upstream.
@@ -2652,8 +2665,11 @@ cmd_agent() {
 }
 cmd_module() {
   load_config          # AI4DEV_WORKSPACE lives in the config, not in the air
-  local n where repo tag branch
+  local n where repo tag branch base
   local which_repo="" onto=0 mode="how" inferred=""
+  # Lab mode. Empty means the whole module, which is every call this command
+  # took before the labs existed and still the common one.
+  local labn="" tag_prefix shown_label where_hint solution_branch unit
 
   # Flags are read out of the arguments first, so that a flag can appear
   # anywhere. The old version read the mode from a fixed position, which meant
@@ -2673,7 +2689,8 @@ cmd_module() {
 
   n="$(module_number "${1:-}")" || {
     printf 'usage: ai4dev module <number> start [--legacy] [--onto]\n'
-    printf '       ai4dev module <number> end [--mine|--checkout] [--legacy]\n\n'
+    printf '       ai4dev module <number> end [--mine|--checkout] [--legacy]\n'
+    printf '       ai4dev module <number> lab <number> [start|end] [--mine|--checkout]\n\n'
     info "start              put me at the beginning of the module, on my own branch"
     info "start --onto       keep the branch I am on and take only the files the"
     info "                   module itself adds — the toolchain, not my work"
@@ -2681,11 +2698,54 @@ cmd_module() {
     info "end --mine         show me how far my work is from it"
     info "end --checkout     put the solution on a branch beside mine, so I can run it"
     printf '\n'
+    info "lab N              the same three questions for ONE lab of a long module."
+    info "                   Defaults to 'end', because inside a module the question"
+    info "                   is almost always how that lab was solved"
+    info "lab N start        put me at the beginning of that lab"
+    printf '\n'
     info "--legacy           work in tinder4dogs-legacy instead of the product"
     exit 2
   }
-  where="${2:-start}"
   local shown="${n#0}"          # "04" is right for a tag and wrong in a sentence
+
+  # `module 13 lab 2 end`: the lab number is positional and the verb after it is
+  # optional. Everything past this point differs only in WHICH tag it is talking
+  # about, so the difference is resolved here, once, into four variables.
+  #
+  # A day-long module is the reason this exists. Seven labs build one feature in
+  # sequence, each one's starting point is the previous one's result, and a group
+  # that loses an hour needs to rejoin at the lab that is running rather than at
+  # the start of the day or the end of it.
+  if [[ "${2:-}" == "lab" ]]; then
+    labn="$(lab_number "${3:-}")" \
+      || die "which lab? ai4dev module $shown lab <number> [start|end]"
+    where="${4:-end}"
+    tag_prefix="module-${n}-lab${labn}"
+    branch="m${n}-lab${labn}"
+    solution_branch="m${n}-lab${labn}-solution"
+    shown_label="module $shown lab $labn"
+    where_hint="lab $labn $where"
+    unit="lab"
+    # --onto takes the files a MODULE introduces, which is a baseline. A lab's
+    # starting point is the previous lab's result, so there is no baseline to
+    # lift out of it and the flag would quietly do something else.
+    [[ "$onto" -eq 0 ]] \
+      || die "--onto is for a whole module, not a lab:  ai4dev module $shown start --onto"
+  else
+    where="${2:-start}"
+    tag_prefix="module-${n}"
+    branch="m${n}"
+    solution_branch="m${n}-solution"
+    shown_label="module $shown"
+    where_hint="$where"
+    unit="module"
+  fi
+
+  # The command to suggest in every message below, with the lab in it when
+  # there is one. Printed advice that drops half the command the user typed is
+  # worse than no advice.
+  local cmd_hint="ai4dev module $shown"
+  [[ -n "$labn" ]] && cmd_hint="$cmd_hint lab $labn"
 
   # `ai4dev module 4 start --checkout` used to accept the flag and ignore it,
   # so you got the plain `start` behaviour and no hint that half your command
@@ -2693,7 +2753,7 @@ cmd_module() {
   case "$where" in
     start)
       [[ "$mode" == "how" ]] \
-        || die "--${mode} belongs to 'end', not 'start'. Did you mean: ai4dev module $shown end --$mode"
+        || die "--${mode} belongs to 'end', not 'start'. Did you mean: $cmd_hint end --$mode"
       ;;
     end)
       [[ "$onto" -eq 0 ]] \
@@ -2729,10 +2789,9 @@ cmd_module() {
 
   case "$where" in
     start)
-      tag="module-${n}-start"
-      branch="m${n}"
+      tag="${tag_prefix}-start"
       module_fetch
-      module_tag_or_die "$tag" "$which_repo" "$shown" "$where"
+      module_tag_or_die "$tag" "$which_repo" "$shown" "$where_hint"
       module_require_clean
 
       if [[ "$onto" -eq 1 ]]; then
@@ -2772,10 +2831,10 @@ cmd_module() {
 
       git switch -C "$branch" "$tag" --quiet \
         || die "could not switch to $tag"
-      ok "you are at the start of module $shown, on branch $branch"
+      ok "you are at the start of $shown_label, on branch $branch"
       info "the tag itself: $tag"
       info "commit as often as you like — this branch is yours"
-      info "when you want to see how it was solved: ai4dev module $shown end"
+      info "when you want to see how it was solved: $cmd_hint end"
       module_after_start_hints
       ;;
     end)
@@ -2790,22 +2849,31 @@ cmd_module() {
       # It used to print only `diff --stat`, which answers none of the three: a
       # list of filenames is a signpost, not an answer, and it cost a second
       # command to get to the thing everybody was actually asking for.
-      tag="module-${n}-end"
-      base="module-${n}-start"
+      tag="${tag_prefix}-end"
+      base="${tag_prefix}-start"
       module_fetch
-      module_tag_or_die "$tag" "$which_repo" "$shown" "$where" \
-        "the solution is published after the module"
+      module_tag_or_die "$tag" "$which_repo" "$shown" "$where_hint" \
+        "the solution is published after the $unit"
 
       case "$mode" in
         checkout)
           module_require_clean
-          git switch -C "m${n}-solution" "$tag" --quiet \
+          # Named BEFORE the switch, because the branch to come back to is the
+          # one you were on and not one this command can compute: a group doing
+          # lab 3 is normally still on the branch they made at the start of the
+          # module, not on a branch named after the lab.
+          local from_branch; from_branch="$(git rev-parse --abbrev-ref HEAD)"
+          git switch -C "$solution_branch" "$tag" --quiet \
             || die "could not switch to $tag"
-          ok "you are on the reference solution, on branch m${n}-solution"
-          info "your own work is still on m${n} — git switch m${n} to go back"
+          ok "you are on the reference solution, on branch $solution_branch"
+          if [[ "$from_branch" != "HEAD" ]]; then
+            info "your own work is still on $from_branch — git switch $from_branch to go back"
+          else
+            info "you were on a detached HEAD before this, so there is no branch to go back to"
+          fi
           ;;
         mine)
-          ok "how your work differs from the reference solution for module $shown"
+          ok "how your work differs from the reference solution for $shown_label"
           printf '\n'
           if git diff --quiet HEAD "$tag"; then
             info "nothing — your tree is identical to $tag"
@@ -2816,13 +2884,13 @@ cmd_module() {
             git diff HEAD "$tag" || true
             printf '\n'
           fi
-          info "how it was solved, on its own:  ai4dev module $shown end"
+          info "how it was solved, on its own:  $cmd_hint end"
           warn "your working tree has NOT been touched"
           ;;
         *)
           # If the start tag is missing, the change is still the commit itself.
           git rev-parse -q --verify "refs/tags/$base" >/dev/null || base="${tag}^"
-          ok "how module $shown was solved — $base..$tag"
+          ok "how $shown_label was solved — $base..$tag"
           printf '\n'
           # Subject only, deliberately. The body of these commits is written for
           # whoever prepares the module and can carry answer-key material; it is
@@ -2835,14 +2903,14 @@ cmd_module() {
           git diff "$base" "$tag" || true
           printf '\n'
           info "why it was done this way:          git log -1 $tag"
-          info "how far your own work is from it:  ai4dev module $shown end --mine"
-          info "check it out and run it:           ai4dev module $shown end --checkout"
+          info "how far your own work is from it:  $cmd_hint end --mine"
+          info "check it out and run it:           $cmd_hint end --checkout"
           warn "your working tree has NOT been touched"
           ;;
       esac
       ;;
     *)
-      die "ai4dev module $shown <start|end>"
+      die "$cmd_hint <start|end>"
       ;;
   esac
 }
@@ -3462,6 +3530,9 @@ ai4dev $AI4DEV_VERSION — the AI4Dev course CLI
                          anywhere else. start also takes
                          --onto to keep the branch you are on and add only the
                          files that module introduces
+  ai4dev module N lab M  the same three questions for one lab of a long module.
+                         'lab M' alone is the diff, --checkout runs it, --mine
+                         compares it; 'lab M start' puts you at its beginning
   ai4dev agent create    have a model write an agent file into your kit. Needs your
                          key, which a bare 'opencode agent create' cannot have
   ai4dev agent list      every agent OpenCode can see. Exits 1 and names the file
