@@ -32,7 +32,7 @@
 
 set -euo pipefail
 
-readonly AI4DEV_VERSION="1.31.0"
+readonly AI4DEV_VERSION="1.32.0"
 MODULE_FETCH_OK=0   # set by module_fetch, read by module_tag_or_die
 
 # The parts of this kit the COURSE owns and may replace. Everything else in
@@ -1132,12 +1132,23 @@ gateway_model_ids() {
   #
   # The `-fallback` aliases are filtered out on purpose: they are what the
   # router reaches for when a primary fails, not something a human picks.
+  #
+  # Embedding aliases are filtered out too, and that is newer. Module 13 added
+  # `embed` to the gateway, `/models` is OpenAI-shaped and says nothing about
+  # what a model is FOR, so the alias arrived in OpenCode's model picker as a
+  # chat model. Somebody picks it once and gets an error that explains nothing.
+  #
+  # The filter is on the NAME, which is a convention and not a fact: the honest
+  # source is `model_info.mode` from LiteLLM's /model/info, and that is not used
+  # here because its response shape has not been measured with a virtual key.
+  # Naming the better answer next to the cheap one.
   local key="${1:-}" body
   body="$(curl -sS --max-time 15 "$AI4DEV_GATEWAY_URL/models" \
             -H "Authorization: Bearer $key" 2>/dev/null)" || return 1
   printf '%s' "$body" | jq -e '
       [ .data[]?.id ]
       | map(select(endswith("-fallback") | not))
+      | map(select((startswith("embed") or test("embedding")) | not))
       | unique
       | select(length > 0)' 2>/dev/null
 }
@@ -1234,13 +1245,27 @@ sync_opencode_config() {
   # regenerates the whole thing would delete an exercise.
   local key="${1:-}" force="${2:-0}"
   local ids default existing before_list before_model after_list after_model tmp
-  local oc_major pkey jq_prog
+  local oc_major jq_prog
 
-  # Unreadable version → assume 1. The v1 shape is the one this course has run
-  # on for ten days; it is the safe default, not v2.
+  # ONE shape, and it is the documented one: `.provider.<id>` with `npm` and
+  # `options`. Read from the OpenCode provider documentation, which describes the
+  # current release.
+  #
+  # This used to branch on the major version and write `.providers` with
+  # `package` and `settings` for anything that was not v1. That branch carried a
+  # comment admitting it had never been run against a v2 binary, and it was
+  # wrong on all three keys: v2 reads `provider`, `npm` and `options`, exactly
+  # like v1. The symptom was the worst kind. OpenCode started, the provider
+  # appeared, the models appeared, and every request went to the gateway with no
+  # Authorization header, so the error came back from LiteLLM as
+  # "Authentication Error, No api key passed in" — which sends you looking at
+  # your key, which is fine, and at the gateway, which is fine.
+  #
+  # The lesson is the one this kit repeats everywhere else: a shape nobody ran
+  # is a guess, and a guess in a config writer fails silently in somebody else's
+  # morning. The version is still read, but only to report it.
   oc_major="$(opencode_major 2>/dev/null || true)"
-  [[ -n "$oc_major" ]] || oc_major=1
-  pkey="provider"; [[ "$oc_major" == "1" ]] || pkey="providers"
+  [[ -n "$oc_major" ]] || oc_major="unknown"
 
   existing='{}'
   if [[ -f "$OPENCODE_CONFIG_FILE" ]]; then
@@ -1257,7 +1282,13 @@ sync_opencode_config() {
 
   if ! ids="$(gateway_model_ids "$key")"; then
     if [[ -f "$OPENCODE_CONFIG_FILE" ]]; then
-      warn "could not reach the gateway — leaving your OpenCode config as it is"
+      # Said in full, because this is the branch that makes `--reconfigure` look
+      # like it repaired something it never touched. Leaving the file alone is
+      # right (a reachable gateway is the only way to know the model list), but
+      # it has to be obvious that nothing was written.
+      warn "could not ask the gateway for your model list, so your OpenCode config was NOT touched"
+      info "  if OpenCode is failing with an authentication error, the config is the suspect and this command did not rewrite it"
+      info "  check the gateway first:  ai4dev doctor"
       return 0
     fi
     warn "could not ask the gateway for your model list, writing the course defaults"
@@ -1270,54 +1301,38 @@ sync_opencode_config() {
     default="$(printf '%s' "$ids" | jq -r '.[0]')"
   fi
 
-  before_list="$(printf '%s' "$existing" | jq -c --arg p "$pkey" '(.[$p].ai4dev.models // {}) | keys')"
+  before_list="$(printf '%s' "$existing" | jq -c '(.provider.ai4dev.models // {}) | keys')"
   before_model="$(printf '%s' "$existing" | jq -r '.model // ""')"
 
   mkdir -p "$(dirname "$OPENCODE_CONFIG_FILE")"
   tmp="$OPENCODE_CONFIG_FILE.tmp.$$"
-  # Neither branch deletes the other one's block. A machine that changes major
-  # version keeps a stale block for the version it is not running, which costs
-  # nothing and means downgrading back to the pinned version needs no repair.
-  if [[ "$oc_major" == "1" ]]; then
-    jq_prog='
-        .["$schema"] = (.["$schema"] // "https://opencode.ai/config.json")
-      | .provider.ai4dev = {
-          npm: "@ai-sdk/openai-compatible",
-          name: "AI4Dev gateway",
-          options: { baseURL: $url, apiKey: "{env:AI4DEV_API_KEY}" },
-          models: (
-            $ids
-            | map({ key: ., value: { name: (if . == $default then . + " (default)" else . end) } })
-            | from_entries
-          )
-        }
-      | .model = ("ai4dev/" + $default)'
-  else
-    # v2 shape, from the official v1→v2 migration guide. NOT measured: no v2
-    # binary was reachable when this was written. `{env:VAR}` is documented as
-    # still supported, which is the part that matters most here. $schema is
-    # deliberately left alone: the v1 URL would be wrong and the v2 one is
-    # unknown, and a wrong one is worse than none.
-    jq_prog='
-        .providers.ai4dev = {
-          package: "aisdk:@ai-sdk/openai-compatible",
-          name: "AI4Dev gateway",
-          settings: { baseURL: $url, apiKey: "{env:AI4DEV_API_KEY}" },
-          models: (
-            $ids
-            | map({ key: ., value: { name: (if . == $default then . + " (default)" else . end) } })
-            | from_entries
-          )
-        }
-      | .model = ("ai4dev/" + $default)'
-  fi
+  # The last two lines remove the block the old version-branching wrote. A
+  # machine that ran a release between 1.28 and 1.31 with OpenCode v2 has a
+  # `.providers.ai4dev` that OpenCode never reads, and leaving it there means the
+  # next person to open this file finds two provider blocks and no way to tell
+  # which one is live. `.providers` itself goes only if nothing else is in it.
+  jq_prog='
+      .["$schema"] = (.["$schema"] // "https://opencode.ai/config.json")
+    | .provider.ai4dev = {
+        npm: "@ai-sdk/openai-compatible",
+        name: "AI4Dev gateway",
+        options: { baseURL: $url, apiKey: "{env:AI4DEV_API_KEY}" },
+        models: (
+          $ids
+          | map({ key: ., value: { name: (if . == $default then . + " (default)" else . end) } })
+          | from_entries
+        )
+      }
+    | .model = ("ai4dev/" + $default)
+    | if (.providers | type) == "object" then del(.providers.ai4dev) else . end
+    | if (.providers | type) == "object" and (.providers | length) == 0 then del(.providers) else . end'
 
   printf '%s' "$existing" | jq \
     --arg url "$AI4DEV_GATEWAY_URL" --arg default "$default" --argjson ids "$ids" \
     "$jq_prog" > "$tmp" || { rm -f "$tmp"; die "could not write $tmp"; }
   mv "$tmp" "$OPENCODE_CONFIG_FILE"
 
-  after_list="$(jq -c --arg p "$pkey" '.[$p].ai4dev.models | keys' "$OPENCODE_CONFIG_FILE")"
+  after_list="$(jq -c '.provider.ai4dev.models | keys' "$OPENCODE_CONFIG_FILE")"
   after_model="$(jq -r '.model' "$OPENCODE_CONFIG_FILE")"
 
   if [[ "$before_list" != "$after_list" || "$before_model" != "$after_model" || "$force" -eq 1 ]]; then
@@ -1363,6 +1378,11 @@ cmd_code() {
   # that file and breaks whatever reads it. Progress goes to stderr; only the
   # wrapped tool's output belongs on stdout.
   sync_opencode_config "$key" "$reconfigure" >&2
+
+  # Same reasoning as the config above, and the same redirect: an agent file in
+  # the kit is worth nothing until it sits where OpenCode looks. Quiet when
+  # there was nothing to do.
+  agent_link_files 1 >&2
 
   # Everywhere else in the course a model is a bare alias: `ai4dev ask
   # --model cheap`. OpenCode wants provider/model and splits on the first "/",
@@ -2388,16 +2408,72 @@ module_require_clean() {
   exit 1
 }
 
-# Every directory OpenCode is known to read agent files from, in both
-# spellings. v1 globs {agent,agents}/**/*.md — measured — and v2 prefers the
-# plural. Listing all of them is cheap and costs nothing when one is absent.
+# Where OpenCode reads agent files, from its own documentation: the global
+# `~/.config/opencode/agents/` and the per-project `.opencode/agents/`. Those
+# two, and nothing else.
+#
+# `$AI4DEV_KIT/agents` is NOT one of them, and this is where that cost somebody
+# an afternoon. `ai4dev agent create` writes there on purpose, because an agent
+# is yours and belongs in your own repository. On v1 that worked by accident:
+# the loader globbed {agent,agents}/**/*.md from the directory OpenCode was
+# started in, so the files were found whenever you were standing in the kit.
+# v2 reads the two documented directories only, so the files stayed exactly
+# where they were and OpenCode stopped seeing them. `ai4dev agent list` read
+# the same directory and said "this is what OpenCode will load", which was the
+# worst possible answer: it agreed with you.
+#
+# So the kit now does for agents what it already does for skills: it symlinks
+# them into the global directory. The file stays in your repository, under your
+# git history, and OpenCode reads it from the one place it looks.
+readonly OPENCODE_AGENT_DIR="$HOME/.config/opencode/agents"
+
 agent_dirs() {
   printf '%s\n' \
     "$AI4DEV_KIT/agents" \
-    "$HOME/.config/opencode/agent" \
-    "$HOME/.config/opencode/agents" \
-    "$PWD/.opencode/agent" \
+    "$OPENCODE_AGENT_DIR" \
     "$PWD/.opencode/agents"
+}
+
+# Is this kit file reachable by OpenCode? True when the global directory holds
+# a link to it, or when the file is already in a directory OpenCode reads.
+agent_is_linked() {
+  local f="$1" base; base="$(basename "$f")"
+  [[ -e "$OPENCODE_AGENT_DIR/$base" ]] && return 0
+  case "$f" in
+    "$OPENCODE_AGENT_DIR"/*|"$PWD/.opencode/agents"/*) return 0 ;;
+  esac
+  return 1
+}
+
+# Links every agent file in the kit into the global directory. Idempotent, and
+# silent unless it actually changed something: it runs on every `ai4dev code`,
+# and a line printed every time is a line nobody reads.
+#
+# `ln -sfn` and not `rm -rf`: if a name in there is a real file somebody wrote
+# by hand, overwriting it silently would be the kit deleting their work. So a
+# name that exists and is not already our link is left alone and reported.
+agent_link_files() {
+  local quiet="${1:-0}" f base linked=0 clashed=()
+  [[ -d "$AI4DEV_KIT/agents" ]] || return 0
+  mkdir -p "$OPENCODE_AGENT_DIR" 2>/dev/null || return 0
+  for f in "$AI4DEV_KIT"/agents/*.md; do
+    [[ -f "$f" ]] || continue
+    base="$(basename "$f")"
+    if [[ -L "$OPENCODE_AGENT_DIR/$base" ]]; then
+      [[ "$(readlink "$OPENCODE_AGENT_DIR/$base")" == "$f" ]] && continue
+    elif [[ -e "$OPENCODE_AGENT_DIR/$base" ]]; then
+      clashed+=("$base"); continue
+    fi
+    ln -sfn "$f" "$OPENCODE_AGENT_DIR/$base" && linked=$((linked+1))
+  done
+  if [[ "$quiet" != "1" ]]; then
+    [[ "$linked" -gt 0 ]] && ok "$linked agent file(s) linked into $OPENCODE_AGENT_DIR"
+    local c
+    for c in ${clashed[@]+"${clashed[@]}"}; do
+      warn "$OPENCODE_AGENT_DIR/$c already exists and is not a link to your kit — left alone"
+    done
+  fi
+  return 0
 }
 
 # Reads the files instead of asking OpenCode. It therefore cannot be broken by
@@ -2408,7 +2484,7 @@ agent_dirs() {
 # What it cannot show is what only OpenCode knows: the built-in agents, and the
 # permissions it resolved. So it is the fallback, not the first choice.
 agent_list_files() {
-  local dir f name mode seen=0
+  local dir f name mode seen=0 unlinked=0
   while IFS= read -r dir; do
     [[ -d "$dir" ]] || continue
     while IFS= read -r f; do
@@ -2419,13 +2495,29 @@ agent_list_files() {
       name="$(awk -F': *' '/^name: */ {print $2; exit}' "$f" 2>/dev/null)"
       [[ -n "$name" ]] || { name="$(basename "$f")"; name="${name%.md}"; }
       mode="$(awk -F': *' '/^mode: */ {print $2; exit}' "$f" 2>/dev/null)"
-      printf '  %-28s %-10s %s\n' "$name" "${mode:-all}" "$f"
+      local mark
+      if agent_is_linked "$f"; then mark="loaded"; else mark="NOT LOADED"; fi
+      printf '  %-28s %-10s %-11s %s\n' "$name" "${mode:-all}" "$mark" "$f"
       seen=$((seen+1))
     done < <(find "$dir" -type f -name '*.md' 2>/dev/null | sort)
   done < <(agent_dirs)
   if [[ "$seen" -eq 0 ]]; then
     info "no agent files found in any of:"
     agent_dirs | sed 's/^/    /'
+    return 0
+  fi
+  # Counted in a second pass because the first one runs in a subshell per
+  # directory and a counter incremented in there does not survive.
+  while IFS= read -r dir; do
+    [[ -d "$dir" ]] || continue
+    while IFS= read -r f; do
+      agent_is_linked "$f" || unlinked=$((unlinked+1))
+    done < <(find "$dir" -type f -name '*.md' 2>/dev/null)
+  done < <(agent_dirs)
+  if [[ "$unlinked" -gt 0 ]]; then
+    printf '\n'
+    bad "$unlinked of them are NOT loaded: the file exists, OpenCode never reads that directory"
+    info "fix all of them with:  ai4dev agent link"
   fi
 }
 
@@ -2573,12 +2665,22 @@ cmd_agent() {
         info "opencode $oc_major has no 'agent' subcommand, so this reads the files directly"
       fi
       printf '\n'
-      info "this is what OpenCode will load:"
+      info "your agent files, and whether OpenCode can actually load them:"
       printf '\n'
       agent_list_files
       printf '\n'
       info "built-in agents and resolved permissions are not shown: only OpenCode knows those"
       ;;
+    link)
+      # Deliberately its own verb and not only a side effect of `ai4dev code`:
+      # when an agent does not show up, the question is "how do I make OpenCode
+      # see it", and the answer should be one command you can be told over the
+      # noise of a classroom.
+      agent_link_files
+      ok "OpenCode reads agent files from $OPENCODE_AGENT_DIR"
+      info "check it with:  ai4dev agent list"
+      ;;
+
     create)
       require_gateway
       local key
@@ -2657,8 +2759,10 @@ cmd_agent() {
       info "create    a model writes the agent file. Defaults to your kit's agents/ and"
       info "          your default alias, and needs your key — which a bare 'opencode"
       info "          agent create' never has"
-      info "list      every agent OpenCode can see. Exits 1 and names the file when one"
-      info "          of them is malformed, which takes all of them down"
+      info "list      every agent file, and whether OpenCode can load it. Exits 1 and"
+      info "          names the file when one is malformed, which takes all of them down"
+      info "link      symlink your kit's agents/ into the directory OpenCode reads."
+      info "          Runs by itself on every 'ai4dev code'; this is the manual button"
       exit 2
       ;;
   esac
